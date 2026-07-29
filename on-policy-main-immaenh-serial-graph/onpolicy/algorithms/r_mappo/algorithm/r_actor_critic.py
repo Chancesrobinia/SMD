@@ -59,6 +59,9 @@ class R_Actor(nn.Module):
         self._use_knn = getattr(args, 'use_knn', True)
         self._use_am_filter = getattr(args, 'use_am_filter', True)
         self._use_smd = getattr(args, 'use_smd', False)
+        self._use_gsd_bsd = getattr(args, 'use_gsd_bsd', False)
+        if self._use_smd and self._use_gsd_bsd:
+            raise RuntimeError("use_smd and use_gsd_bsd cannot be enabled together")
         self.last_graph_gates = None
 
         # ============================================================
@@ -131,7 +134,24 @@ class R_Actor(nn.Module):
                     smd_use_positive_adv_only=getattr(args, 'smd_use_positive_adv_only', False),
                     smd_online_sampling=getattr(args, 'smd_online_sampling', False),
                     smd_debug_shapes=getattr(args, 'smd_debug_shapes', False),
+                    use_gsd_bsd=self._use_gsd_bsd,
+                    gsd_bsd_ally_candidate_k=getattr(args, 'gsd_bsd_ally_candidate_k', 4),
+                    gsd_bsd_enemy_candidate_k=getattr(args, 'gsd_bsd_enemy_candidate_k', 4),
+                    gsd_bsd_ally_edge_m=getattr(args, 'gsd_bsd_ally_edge_m', 2),
+                    gsd_bsd_enemy_edge_m=getattr(args, 'gsd_bsd_enemy_edge_m', 1),
+                    gsd_bsd_hidden_dim=getattr(args, 'gsd_bsd_hidden_dim', 64),
+                    gsd_bsd_num_heads=getattr(args, 'gsd_bsd_num_heads', 2),
+                    gsd_bsd_num_layers=getattr(args, 'gsd_bsd_num_layers', 1),
+                    gsd_bsd_type_embedding_dim=getattr(args, 'gsd_bsd_type_embedding_dim', 8),
+                    gsd_bsd_state_embedding_dim=getattr(args, 'gsd_bsd_state_embedding_dim', 8),
+                    gsd_bsd_time_embedding_dim=getattr(args, 'gsd_bsd_time_embedding_dim', 16),
+                    gsd_bsd_denoise_steps=getattr(args, 'gsd_bsd_denoise_steps', 1),
+                    gsd_bsd_use_st_mask=getattr(args, 'gsd_bsd_use_st_mask', True),
+                    gsd_bsd_enemy_base_score_source=getattr(args, 'gsd_bsd_enemy_base_score_source', 'auto'),
+                    gsd_bsd_debug=getattr(args, 'gsd_bsd_debug', False),
                 )
+            elif self._use_gsd_bsd:
+                raise RuntimeError("use_gsd_bsd=True but selected Actor branch does not support GSD-BSD")
             self.base = graph_base_cls(
                 agent_state_dim=self.agent_state_dim,
                 landmark_dim=self.landmark_dim,
@@ -666,6 +686,31 @@ class R_Actor(nn.Module):
             active_masks=active_masks if self._use_policy_active_masks else None)
 
         return action_log_probs, dist_entropy, smd_aux
+
+    def evaluate_actions_with_gsd_bsd(self, obs, rnn_states, action, masks, available_actions=None, active_masks=None):
+        """
+        Evaluate actions and return GSD-BSD auxiliary tensors produced by Hop3.
+        """
+        obs = check(obs).to(**self.tpdv)
+        rnn_states = check(rnn_states).to(**self.tpdv)
+        action = check(action).to(**self.tpdv)
+        masks = check(masks).to(**self.tpdv)
+        if available_actions is not None:
+            available_actions = check(available_actions).to(**self.tpdv)
+        if active_masks is not None:
+            active_masks = check(active_masks).to(**self.tpdv)
+
+        actor_features, _ = self._extract_features(obs)
+        bsd_aux = getattr(self.base, "last_gsd_bsd_aux", {}) if self._use_hetero_graph else {}
+
+        if self._use_naive_recurrent_policy or self._use_recurrent_policy:
+            actor_features, rnn_states = self.rnn(actor_features, rnn_states, masks)
+
+        action_log_probs, dist_entropy = self.act.evaluate_actions(
+            actor_features, action, available_actions,
+            active_masks=active_masks if self._use_policy_active_masks else None)
+
+        return action_log_probs, dist_entropy, bsd_aux
 
     def evaluate_actions_with_recon(self, obs, rnn_states, action, masks, available_actions=None, active_masks=None):
         """

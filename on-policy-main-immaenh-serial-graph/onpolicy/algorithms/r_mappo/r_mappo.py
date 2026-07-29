@@ -1,9 +1,11 @@
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from onpolicy.utils.util import get_gard_norm, huber_loss, mse_loss
 from onpolicy.utils.valuenorm import ValueNorm
 from onpolicy.algorithms.utils.util import check
+from onpolicy.algorithms.utils.gsd_bsd import operation_target_index
 
 class R_MAPPO():
     """
@@ -45,6 +47,10 @@ class R_MAPPO():
         self._use_am_filter = getattr(args, 'use_am_filter', True)
         self.recon_loss_coef = getattr(args, 'recon_loss_coef', 0.01)
         self._use_smd = getattr(args, 'use_smd', False)
+        self._use_gsd_bsd = getattr(args, 'use_gsd_bsd', False)
+        self.lambda_gsd_bsd_diff = getattr(args, 'lambda_gsd_bsd_diff', 0.01)
+        self.lambda_gsd_bsd_noop = getattr(args, 'lambda_gsd_bsd_noop', 1.0)
+        self.lambda_gsd_bsd_action_consistency = getattr(args, 'lambda_gsd_bsd_action_consistency', 0.0)
 
         assert (self._use_popart and self._use_valuenorm) == False, ("self._use_popart and self._use_valuenorm can not be set True simultaneously")
         
@@ -141,6 +147,157 @@ class R_MAPPO():
         }
         return smd_loss, info
 
+    def compute_gsd_bsd_aux_loss(self, bsd_aux):
+        if not bsd_aux:
+            zero = torch.tensor(0.0, device=self.device)
+            info = {
+                'gsd_bsd/ally_diffusion_loss': 0.0,
+                'gsd_bsd/enemy_diffusion_loss': 0.0,
+                'gsd_bsd/total_diffusion_loss': 0.0,
+                'gsd_bsd/ally_valid_count': 0.0,
+                'gsd_bsd/enemy_valid_count': 0.0,
+                'gsd_bsd/ally_selected_count': 0.0,
+                'gsd_bsd/enemy_selected_count': 0.0,
+                'gsd_bsd/ally_swap_rate': 0.0,
+                'gsd_bsd/enemy_swap_rate': 0.0,
+                'gsd_bsd/ally_noop_rate': 0.0,
+                'gsd_bsd/enemy_noop_rate': 0.0,
+                'gsd_bsd/ally_operation_entropy': 0.0,
+                'gsd_bsd/enemy_operation_entropy': 0.0,
+                'gsd_bsd/ally_soft_budget_error': 0.0,
+                'gsd_bsd/enemy_soft_budget_error': 0.0,
+                'gsd_bsd/ally_mask_change_rate': 0.0,
+                'gsd_bsd/enemy_mask_change_rate': 0.0,
+                'gsd_bsd/base_surrogate': 0.0,
+                'gsd_bsd/target_surrogate': 0.0,
+                'gsd_bsd/surrogate_improvement': 0.0,
+                'gsd_bsd/target_changed_rate': 0.0,
+                'gsd_bsd/target_search_candidates': 0.0,
+                'gsd_bsd/target_search_time_ms': 0.0,
+                'gsd_bsd/denoiser_time_ms': 0.0,
+            }
+            return zero, info
+
+        def _branch_loss(prefix):
+            operation = bsd_aux.get(f'{prefix}_operation', {})
+            operation_logits = bsd_aux.get(f'{prefix}_operation_logits')
+            if operation_logits is None or operation_logits.numel() == 0:
+                zero = torch.tensor(0.0, device=self.device)
+                return zero, {
+                    f'gsd_bsd/{prefix}_diffusion_loss': 0.0,
+                    f'gsd_bsd/{prefix}_valid_count': 0.0,
+                    f'gsd_bsd/{prefix}_selected_count': 0.0,
+                    f'gsd_bsd/{prefix}_swap_rate': 0.0,
+                    f'gsd_bsd/{prefix}_noop_rate': 0.0,
+                    f'gsd_bsd/{prefix}_operation_entropy': 0.0,
+                    f'gsd_bsd/{prefix}_soft_budget_error': 0.0,
+                    f'gsd_bsd/{prefix}_mask_change_rate': 0.0,
+                    f'gsd_bsd/{prefix}_base_surrogate': 0.0,
+                    f'gsd_bsd/{prefix}_target_surrogate': 0.0,
+                    f'gsd_bsd/{prefix}_surrogate_improvement': 0.0,
+                    f'gsd_bsd/{prefix}_target_changed_rate': 0.0,
+                    f'gsd_bsd/{prefix}_target_search_candidates': 0.0,
+                    f'gsd_bsd/{prefix}_target_search_time_ms': 0.0,
+                    f'gsd_bsd/{prefix}_denoiser_time_ms': 0.0,
+                    f'gsd_bsd/{prefix}_operation_loss': 0.0,
+                    f'gsd_bsd/{prefix}_noop_loss': 0.0,
+                }
+
+            base_mask = bsd_aux.get(f'{prefix}_base_mask')
+            hard_mask = bsd_aux.get(f'{prefix}_hard_mask')
+            soft_mask = bsd_aux.get(f'{prefix}_soft_mask')
+            valid_mask = bsd_aux.get(f'{prefix}_valid_mask')
+            valid_ops = bsd_aux.get(f'{prefix}_operation_valid')
+            if base_mask is None or hard_mask is None or valid_mask is None or valid_ops is None:
+                zero = torch.tensor(0.0, device=operation_logits.device)
+                return zero, {}
+
+            base_mask = base_mask.to(device=operation_logits.device)
+            hard_mask = hard_mask.to(device=operation_logits.device)
+            soft_mask = soft_mask.to(device=operation_logits.device) if soft_mask is not None else base_mask
+            valid_mask = valid_mask.to(device=operation_logits.device)
+            valid_ops = valid_ops.to(device=operation_logits.device)
+            masked_logits = operation_logits.masked_fill(~valid_ops, -1e9)
+            valid_count = valid_mask.sum(dim=-1).float()
+            selected_count = base_mask.sum(dim=-1).float()
+
+            drop_mask = (base_mask > 0.5) & (hard_mask <= 0.5)
+            add_mask = (base_mask <= 0.5) & (hard_mask > 0.5)
+            noop = ~(drop_mask.any(dim=-1) & add_mask.any(dim=-1))
+            drop_index = torch.full((base_mask.shape[0],), -1, dtype=torch.long, device=base_mask.device)
+            add_index = torch.full((base_mask.shape[0],), -1, dtype=torch.long, device=base_mask.device)
+            if drop_mask.numel() > 0:
+                drop_index = torch.where(
+                    drop_mask.any(dim=-1),
+                    drop_mask.to(dtype=torch.long).argmax(dim=-1),
+                    drop_index,
+                )
+                add_index = torch.where(
+                    add_mask.any(dim=-1),
+                    add_mask.to(dtype=torch.long).argmax(dim=-1),
+                    add_index,
+                )
+
+            try:
+                target_index = operation_target_index(operation, drop_index, add_index, noop)
+            except Exception:
+                target_index = torch.zeros(base_mask.shape[0], dtype=torch.long, device=base_mask.device)
+                noop = torch.ones_like(noop)
+
+            per_sample_loss = F.cross_entropy(masked_logits, target_index, reduction='none')
+            noop_weight = torch.where(
+                noop.to(dtype=torch.bool),
+                torch.full_like(per_sample_loss, float(self.lambda_gsd_bsd_noop)),
+                torch.ones_like(per_sample_loss),
+            )
+            op_loss = (per_sample_loss * noop_weight).mean()
+            probs = F.softmax(masked_logits, dim=-1)
+            valid_probs = probs * valid_ops.to(dtype=probs.dtype)
+            valid_probs = valid_probs / valid_probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+            op_entropy = -(valid_probs * valid_probs.clamp_min(1e-12).log()).sum(dim=-1).mean()
+
+            swap_rate = (~noop).float().mean().detach()
+            noop_rate = noop.float().mean().detach()
+            mask_change = (hard_mask - base_mask).abs().sum(dim=-1) / valid_count.clamp_min(1.0)
+            soft_budget_error = (soft_mask.sum(dim=-1) - base_mask.sum(dim=-1)).abs().mean().detach()
+            target_changed = (~noop).float().mean().detach()
+
+            info = {
+                f'gsd_bsd/{prefix}_diffusion_loss': op_loss.detach().item(),
+                f'gsd_bsd/{prefix}_valid_count': valid_count.mean().detach().item(),
+                f'gsd_bsd/{prefix}_selected_count': selected_count.mean().detach().item(),
+                f'gsd_bsd/{prefix}_swap_rate': swap_rate.item(),
+                f'gsd_bsd/{prefix}_noop_rate': noop_rate.item(),
+                f'gsd_bsd/{prefix}_operation_entropy': op_entropy.detach().item(),
+                f'gsd_bsd/{prefix}_soft_budget_error': soft_budget_error.item(),
+                f'gsd_bsd/{prefix}_mask_change_rate': mask_change.mean().detach().item(),
+                f'gsd_bsd/{prefix}_base_surrogate': 0.0,
+                f'gsd_bsd/{prefix}_target_surrogate': 0.0,
+                f'gsd_bsd/{prefix}_surrogate_improvement': 0.0,
+                f'gsd_bsd/{prefix}_target_changed_rate': target_changed.item(),
+                f'gsd_bsd/{prefix}_target_search_candidates': float(operation_logits.shape[-1]),
+                f'gsd_bsd/{prefix}_target_search_time_ms': 0.0,
+                f'gsd_bsd/{prefix}_denoiser_time_ms': 0.0,
+                f'gsd_bsd/{prefix}_operation_loss': op_loss.detach().item(),
+                f'gsd_bsd/{prefix}_noop_loss': (per_sample_loss[noop] * self.lambda_gsd_bsd_noop).mean().detach().item() if noop.any() else 0.0,
+            }
+            return op_loss, info
+
+        ally_loss, ally_info = _branch_loss('ally')
+        enemy_loss, enemy_info = _branch_loss('enemy')
+        total = self.lambda_gsd_bsd_diff * (ally_loss + enemy_loss)
+        if self.lambda_gsd_bsd_action_consistency:
+            total = total + self.lambda_gsd_bsd_action_consistency * torch.tensor(0.0, device=total.device)
+
+        info = {
+            'gsd_bsd/ally_diffusion_loss': ally_info.get('gsd_bsd/ally_diffusion_loss', 0.0),
+            'gsd_bsd/enemy_diffusion_loss': enemy_info.get('gsd_bsd/enemy_diffusion_loss', 0.0),
+            'gsd_bsd/total_diffusion_loss': total.detach().item(),
+        }
+        info.update(ally_info)
+        info.update(enemy_info)
+        return total, info
+
     def cal_value_loss(self, values, value_preds_batch, return_batch, active_masks_batch):
         """
         Calculate value function loss.
@@ -211,6 +368,8 @@ class R_MAPPO():
         # Reshape to do in a single forward pass for all steps
         smd_loss = torch.tensor(0.0, device=self.device)
         smd_info = {}
+        gsd_bsd_loss = torch.tensor(0.0, device=self.device)
+        gsd_bsd_info = {}
         if self._use_smd:
             values, action_log_probs, dist_entropy, smd_aux = self.policy.evaluate_actions_with_smd(
                                                                               share_obs_batch,
@@ -223,6 +382,18 @@ class R_MAPPO():
                                                                               active_masks_batch)
             recon_loss = torch.tensor(0.0, device=self.device)
             smd_loss, smd_info = self.compute_smd_aux_loss(smd_aux, adv_targ)
+        elif self._use_gsd_bsd:
+            values, action_log_probs, dist_entropy, bsd_aux = self.policy.evaluate_actions_with_gsd_bsd(
+                                                                              share_obs_batch,
+                                                                              obs_batch,
+                                                                              rnn_states_batch,
+                                                                              rnn_states_critic_batch,
+                                                                              actions_batch,
+                                                                              masks_batch,
+                                                                              available_actions_batch,
+                                                                              active_masks_batch)
+            recon_loss = torch.tensor(0.0, device=self.device)
+            gsd_bsd_loss, gsd_bsd_info = self.compute_gsd_bsd_aux_loss(bsd_aux)
         elif self._use_esmg and self._use_am_filter:
             values, action_log_probs, dist_entropy, recon_loss = self.policy.evaluate_actions_with_recon(
                                                                               share_obs_batch,
@@ -261,7 +432,7 @@ class R_MAPPO():
         self.policy.actor_optimizer.zero_grad()
 
         if update_actor:
-            total_actor_loss = policy_loss - dist_entropy * self.entropy_coef + recon_loss * self.recon_loss_coef + smd_loss
+            total_actor_loss = policy_loss - dist_entropy * self.entropy_coef + recon_loss * self.recon_loss_coef + smd_loss + gsd_bsd_loss
             total_actor_loss.backward()
 
         if self._use_max_grad_norm:
@@ -285,7 +456,8 @@ class R_MAPPO():
 
         self.policy.critic_optimizer.step()
 
-        return value_loss, critic_grad_norm, policy_loss, dist_entropy, actor_grad_norm, imp_weights, smd_loss, smd_info
+        smd_info.update(gsd_bsd_info)
+        return value_loss, critic_grad_norm, policy_loss, dist_entropy, actor_grad_norm, imp_weights, smd_loss + gsd_bsd_loss, smd_info
 
     def train(self, buffer, update_actor=True):
         """
@@ -324,6 +496,30 @@ class R_MAPPO():
         train_info['smd_edge_prob_max'] = 0
         train_info['smd_hard_edge_ratio'] = 0
         train_info['smd_pseudo_positive_ratio'] = 0
+        train_info['gsd_bsd/ally_diffusion_loss'] = 0
+        train_info['gsd_bsd/enemy_diffusion_loss'] = 0
+        train_info['gsd_bsd/total_diffusion_loss'] = 0
+        train_info['gsd_bsd/ally_valid_count'] = 0
+        train_info['gsd_bsd/enemy_valid_count'] = 0
+        train_info['gsd_bsd/ally_selected_count'] = 0
+        train_info['gsd_bsd/enemy_selected_count'] = 0
+        train_info['gsd_bsd/ally_swap_rate'] = 0
+        train_info['gsd_bsd/enemy_swap_rate'] = 0
+        train_info['gsd_bsd/ally_noop_rate'] = 0
+        train_info['gsd_bsd/enemy_noop_rate'] = 0
+        train_info['gsd_bsd/ally_operation_entropy'] = 0
+        train_info['gsd_bsd/enemy_operation_entropy'] = 0
+        train_info['gsd_bsd/ally_soft_budget_error'] = 0
+        train_info['gsd_bsd/enemy_soft_budget_error'] = 0
+        train_info['gsd_bsd/ally_mask_change_rate'] = 0
+        train_info['gsd_bsd/enemy_mask_change_rate'] = 0
+        train_info['gsd_bsd/base_surrogate'] = 0
+        train_info['gsd_bsd/target_surrogate'] = 0
+        train_info['gsd_bsd/surrogate_improvement'] = 0
+        train_info['gsd_bsd/target_changed_rate'] = 0
+        train_info['gsd_bsd/target_search_candidates'] = 0
+        train_info['gsd_bsd/target_search_time_ms'] = 0
+        train_info['gsd_bsd/denoiser_time_ms'] = 0
 
         for _ in range(self.ppo_epoch):
             if self._use_recurrent_policy:
@@ -355,6 +551,30 @@ class R_MAPPO():
                     'smd_edge_prob_max',
                     'smd_hard_edge_ratio',
                     'smd_pseudo_positive_ratio',
+                    'gsd_bsd/ally_diffusion_loss',
+                    'gsd_bsd/enemy_diffusion_loss',
+                    'gsd_bsd/total_diffusion_loss',
+                    'gsd_bsd/ally_valid_count',
+                    'gsd_bsd/enemy_valid_count',
+                    'gsd_bsd/ally_selected_count',
+                    'gsd_bsd/enemy_selected_count',
+                    'gsd_bsd/ally_swap_rate',
+                    'gsd_bsd/enemy_swap_rate',
+                    'gsd_bsd/ally_noop_rate',
+                    'gsd_bsd/enemy_noop_rate',
+                    'gsd_bsd/ally_operation_entropy',
+                    'gsd_bsd/enemy_operation_entropy',
+                    'gsd_bsd/ally_soft_budget_error',
+                    'gsd_bsd/enemy_soft_budget_error',
+                    'gsd_bsd/ally_mask_change_rate',
+                    'gsd_bsd/enemy_mask_change_rate',
+                    'gsd_bsd/base_surrogate',
+                    'gsd_bsd/target_surrogate',
+                    'gsd_bsd/surrogate_improvement',
+                    'gsd_bsd/target_changed_rate',
+                    'gsd_bsd/target_search_candidates',
+                    'gsd_bsd/target_search_time_ms',
+                    'gsd_bsd/denoiser_time_ms',
                 ):
                     train_info[key] += float(smd_info.get(key, 0.0))
 

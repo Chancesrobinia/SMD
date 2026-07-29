@@ -13,6 +13,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 from onpolicy.algorithms.utils.sparse_mask_student import StudentSparseMaskHead
 from onpolicy.algorithms.utils.sparse_mask_diffusion import SparseMaskDiffusionTeacher
+from onpolicy.algorithms.utils.gsd_bsd import (
+    AllyEnemyInteractionFusion,
+    JointBudgetPreservingSubgraphDenoiser,
+    MaskedRelationAttention,
+    RelationEncoder,
+    apply_budget_operation,
+    budget_topm_mask,
+    build_budget_operation_distribution,
+    select_relation_candidates,
+    straight_through_budget_mask,
+)
 
 
 class GraphAttentionLayer(nn.Module):
@@ -190,6 +201,21 @@ class ParallelAllyEntityGraphActorBase(nn.Module):
         smd_use_positive_adv_only=False,
         smd_online_sampling=False,
         smd_debug_shapes=False,
+        use_gsd_bsd=False,
+        gsd_bsd_ally_candidate_k=4,
+        gsd_bsd_enemy_candidate_k=4,
+        gsd_bsd_ally_edge_m=2,
+        gsd_bsd_enemy_edge_m=1,
+        gsd_bsd_hidden_dim=64,
+        gsd_bsd_num_heads=2,
+        gsd_bsd_num_layers=1,
+        gsd_bsd_type_embedding_dim=8,
+        gsd_bsd_state_embedding_dim=8,
+        gsd_bsd_time_embedding_dim=16,
+        gsd_bsd_denoise_steps=1,
+        gsd_bsd_use_st_mask=True,
+        gsd_bsd_enemy_base_score_source="auto",
+        gsd_bsd_debug=False,
     ):
         super(ParallelAllyEntityGraphActorBase, self).__init__()
         self.agent_state_dim = agent_state_dim
@@ -410,6 +436,21 @@ class EntityEnemyFirstGraphActorBase(nn.Module):
         smd_use_positive_adv_only=False,
         smd_online_sampling=False,
         smd_debug_shapes=False,
+        use_gsd_bsd=False,
+        gsd_bsd_ally_candidate_k=4,
+        gsd_bsd_enemy_candidate_k=4,
+        gsd_bsd_ally_edge_m=2,
+        gsd_bsd_enemy_edge_m=1,
+        gsd_bsd_hidden_dim=64,
+        gsd_bsd_num_heads=2,
+        gsd_bsd_num_layers=1,
+        gsd_bsd_type_embedding_dim=8,
+        gsd_bsd_state_embedding_dim=8,
+        gsd_bsd_time_embedding_dim=16,
+        gsd_bsd_denoise_steps=1,
+        gsd_bsd_use_st_mask=True,
+        gsd_bsd_enemy_base_score_source="auto",
+        gsd_bsd_debug=False,
     ):
         super(EntityEnemyFirstGraphActorBase, self).__init__()
         self.agent_state_dim = agent_state_dim
@@ -704,6 +745,21 @@ class HeteroGraphActorBase(nn.Module):
         smd_use_positive_adv_only=False,
         smd_online_sampling=False,
         smd_debug_shapes=False,
+        use_gsd_bsd=False,
+        gsd_bsd_ally_candidate_k=4,
+        gsd_bsd_enemy_candidate_k=4,
+        gsd_bsd_ally_edge_m=2,
+        gsd_bsd_enemy_edge_m=1,
+        gsd_bsd_hidden_dim=64,
+        gsd_bsd_num_heads=2,
+        gsd_bsd_num_layers=1,
+        gsd_bsd_type_embedding_dim=8,
+        gsd_bsd_state_embedding_dim=8,
+        gsd_bsd_time_embedding_dim=16,
+        gsd_bsd_denoise_steps=1,
+        gsd_bsd_use_st_mask=True,
+        gsd_bsd_enemy_base_score_source="auto",
+        gsd_bsd_debug=False,
     ):
         super(HeteroGraphActorBase, self).__init__()
         self.agent_state_dim = agent_state_dim
@@ -719,6 +775,24 @@ class HeteroGraphActorBase(nn.Module):
         self.use_am_filter = use_am_filter
         self.use_gated_fusion = use_gated_fusion
         self.use_smd = use_smd
+        self.use_gsd_bsd = use_gsd_bsd
+        self.supports_gsd_bsd = True
+        if self.use_smd and self.use_gsd_bsd:
+            raise RuntimeError("use_smd and use_gsd_bsd cannot be enabled together")
+        if gsd_bsd_denoise_steps != 1:
+            raise ValueError("GSD-BSD first version only supports gsd_bsd_denoise_steps=1")
+        if not (0 <= int(gsd_bsd_ally_edge_m) <= int(gsd_bsd_ally_candidate_k)):
+            raise ValueError("gsd_bsd_ally_edge_m must satisfy 0 <= edge_m <= ally_candidate_k")
+        if not (0 <= int(gsd_bsd_enemy_edge_m) <= int(gsd_bsd_enemy_candidate_k)):
+            raise ValueError("gsd_bsd_enemy_edge_m must satisfy 0 <= edge_m <= enemy_candidate_k")
+        self.gsd_bsd_ally_candidate_k = int(gsd_bsd_ally_candidate_k)
+        self.gsd_bsd_enemy_candidate_k = int(gsd_bsd_enemy_candidate_k)
+        self.gsd_bsd_ally_edge_m = int(gsd_bsd_ally_edge_m)
+        self.gsd_bsd_enemy_edge_m = int(gsd_bsd_enemy_edge_m)
+        self.gsd_bsd_use_st_mask = bool(gsd_bsd_use_st_mask)
+        self.gsd_bsd_enemy_base_score_source = gsd_bsd_enemy_base_score_source
+        self.gsd_bsd_debug = gsd_bsd_debug
+        self.gsd_bsd_actual_enemy_base_score_source = "none"
         self.smd_candidate_top_k = smd_candidate_top_k
         self.smd_pseudo_top_m = smd_pseudo_top_m
         self.smd_use_positive_adv_only = smd_use_positive_adv_only
@@ -727,6 +801,7 @@ class HeteroGraphActorBase(nn.Module):
         self.lambda_smd_sparse = lambda_smd_sparse
         self.smd_target_degree = smd_target_degree
         self.last_smd_aux = {}
+        self.last_gsd_bsd_aux = {}
         if smd_online_sampling:
             raise ValueError("SMD diffusion online sampling is disabled; use StudentSparseMaskHead for PPO forward.")
         self.last_g_intent = None
@@ -791,6 +866,32 @@ class HeteroGraphActorBase(nn.Module):
         self.linear_v3 = nn.Linear(self.ally_dim, H)
         self.linear_out3 = nn.Linear(H, H)
         self._init_manual_layers(use_orthogonal, use_ReLU)
+
+        self.ally_relation_encoder = None
+        self.enemy_relation_encoder = None
+        self.gsd_bsd_denoiser = None
+        self.enemy_base_relation_scorer = None
+        self.ally_relation_attention = None
+        self.enemy_relation_attention = None
+        self.gsd_bsd_fusion = None
+        if self.use_gsd_bsd:
+            relation_dim = H
+            self.ally_relation_encoder = RelationEncoder(agent_state_dim, H, self.ally_dim, relation_dim, use_ReLU=use_ReLU)
+            self.enemy_relation_encoder = RelationEncoder(agent_state_dim, H, self.enemy_dim, relation_dim, use_ReLU=use_ReLU)
+            self.gsd_bsd_denoiser = JointBudgetPreservingSubgraphDenoiser(
+                relation_dim=relation_dim,
+                condition_dim=H * 2,
+                hidden_dim=gsd_bsd_hidden_dim,
+                num_heads=gsd_bsd_num_heads,
+                num_layers=gsd_bsd_num_layers,
+                type_embedding_dim=gsd_bsd_type_embedding_dim,
+                state_embedding_dim=gsd_bsd_state_embedding_dim,
+                time_embedding_dim=gsd_bsd_time_embedding_dim,
+            )
+            self.enemy_base_relation_scorer = nn.Sequential(nn.Linear(relation_dim, H), act_fn, nn.Linear(H, 1))
+            self.ally_relation_attention = MaskedRelationAttention(agent_state_dim + H, relation_dim, self.ally_dim, H)
+            self.enemy_relation_attention = MaskedRelationAttention(agent_state_dim + H, relation_dim, self.enemy_dim, H)
+            self.gsd_bsd_fusion = AllyEnemyInteractionFusion(agent_state_dim, H, use_ReLU=use_ReLU)
 
         if self.use_gated_fusion:
             self.fusion = GatedConcatenationFusion(
@@ -873,6 +974,148 @@ class HeteroGraphActorBase(nn.Module):
         attn_mean = attn.squeeze(2).mean(dim=1)                               # Shape: [B, S]
         return out, attn_mean
 
+    def _gsd_bsd_forward(self, agent_state, ally_obs, enemy_obs, ally_valid, enemy_valid, m_ally, m_threat, attn_threat):
+        B = agent_state.shape[0]
+        H = self.hidden_size
+        if ally_valid is None:
+            ally_valid = agent_state.new_ones(B, ally_obs.shape[1], dtype=torch.bool)
+        if enemy_valid is None:
+            enemy_valid = agent_state.new_ones(B, enemy_obs.shape[1], dtype=torch.bool)
+
+        ally_candidates = select_relation_candidates(
+            ally_obs, ally_obs[..., :2], ally_valid, self.gsd_bsd_ally_candidate_k
+        )
+        enemy_candidates = select_relation_candidates(
+            enemy_obs, enemy_obs[..., :2], enemy_valid, self.gsd_bsd_enemy_candidate_k
+        )
+        ally_features = ally_candidates["candidate_features"]
+        enemy_features = enemy_candidates["candidate_features"]
+        ally_rel = ally_candidates["candidate_relative_positions"]
+        enemy_rel = enemy_candidates["candidate_relative_positions"]
+        ally_candidate_valid = ally_candidates["candidate_valid_mask"]
+        enemy_candidate_valid = enemy_candidates["candidate_valid_mask"]
+
+        ally_tokens = self.ally_relation_encoder(
+            agent_state, m_ally, m_threat, ally_features, ally_rel, ally_candidate_valid
+        )
+        enemy_tokens = self.enemy_relation_encoder(
+            agent_state, m_ally, m_threat, enemy_features, enemy_rel, enemy_candidate_valid
+        )
+
+        if ally_tokens.shape[1] > 0:
+            threat_expand = m_threat.unsqueeze(1).expand(-1, ally_tokens.shape[1], -1)
+            ally_base_logits = self.synergy_mlp(torch.cat([threat_expand, ally_features], dim=-1)).squeeze(-1)
+            ally_base_logits = ally_base_logits.masked_fill(~ally_candidate_valid, -1e9)
+        else:
+            ally_base_logits = agent_state.new_zeros(B, 0)
+
+        if enemy_tokens.shape[1] > 0:
+            if self.gsd_bsd_enemy_base_score_source in ("auto", "learned"):
+                self.gsd_bsd_actual_enemy_base_score_source = "learned"
+                enemy_base_logits = self.enemy_base_relation_scorer(enemy_tokens).squeeze(-1)
+            elif self.gsd_bsd_enemy_base_score_source == "distance":
+                self.gsd_bsd_actual_enemy_base_score_source = "distance"
+                enemy_base_logits = -torch.norm(enemy_rel[..., :2], dim=-1)
+            else:
+                self.gsd_bsd_actual_enemy_base_score_source = "learned"
+                enemy_base_logits = self.enemy_base_relation_scorer(enemy_tokens).squeeze(-1)
+            enemy_base_logits = enemy_base_logits.masked_fill(~enemy_candidate_valid, -1e9)
+        else:
+            self.gsd_bsd_actual_enemy_base_score_source = "none"
+            enemy_base_logits = agent_state.new_zeros(B, 0)
+
+        ally_base_mask = budget_topm_mask(ally_base_logits, ally_candidate_valid, self.gsd_bsd_ally_edge_m)
+        enemy_base_mask = budget_topm_mask(enemy_base_logits, enemy_candidate_valid, self.gsd_bsd_enemy_edge_m)
+
+        condition = torch.cat([m_ally, m_threat], dim=-1)
+        denoise = self.gsd_bsd_denoiser(
+            ally_tokens,
+            enemy_tokens,
+            ally_base_mask,
+            enemy_base_mask,
+            ally_candidate_valid,
+            enemy_candidate_valid,
+            condition,
+            diffusion_timestep=0,
+        )
+        ally_ops = build_budget_operation_distribution(
+            denoise["ally_drop_logits"],
+            denoise["ally_add_logits"],
+            denoise["ally_noop_logits"],
+            ally_base_mask,
+            ally_candidate_valid,
+        )
+        enemy_ops = build_budget_operation_distribution(
+            denoise["enemy_drop_logits"],
+            denoise["enemy_add_logits"],
+            denoise["enemy_noop_logits"],
+            enemy_base_mask,
+            enemy_candidate_valid,
+        )
+        ally_hard, ally_soft = apply_budget_operation(ally_base_mask, ally_candidate_valid, ally_ops)
+        enemy_hard, enemy_soft = apply_budget_operation(enemy_base_mask, enemy_candidate_valid, enemy_ops)
+        ally_final_mask = straight_through_budget_mask(ally_hard, ally_soft) if self.gsd_bsd_use_st_mask and self.training else ally_hard
+        enemy_final_mask = straight_through_budget_mask(enemy_hard, enemy_soft) if self.gsd_bsd_use_st_mask and self.training else enemy_hard
+
+        q_ally = torch.cat([agent_state, m_threat], dim=-1)
+        q_enemy = torch.cat([agent_state, m_ally], dim=-1)
+        ally_context, ally_attn = self.ally_relation_attention(
+            q_ally, ally_tokens, ally_features, ally_final_mask, ally_candidate_valid
+        )
+        enemy_context, enemy_attn = self.enemy_relation_attention(
+            q_enemy, enemy_tokens, enemy_features, enemy_final_mask, enemy_candidate_valid
+        )
+        features, gates = self.gsd_bsd_fusion(agent_state, ally_context, enemy_context)
+        max_pool = max(attn_threat.shape[1], ally_attn.shape[1], enemy_attn.shape[1])
+
+        def _pad(t, target):
+            if t.shape[1] < target:
+                return F.pad(t, (0, target - t.shape[1]))
+            return t
+
+        latent_beliefs = torch.stack(
+            [_pad(attn_threat, max_pool), _pad(ally_attn, max_pool), _pad(enemy_attn, max_pool)], dim=1
+        )
+        ally_swap = (ally_hard - ally_base_mask).abs().sum(-1) > 0
+        enemy_swap = (enemy_hard - enemy_base_mask).abs().sum(-1) > 0
+        self.last_gsd_bsd_aux = {
+            "ally_relation_tokens": ally_tokens,
+            "enemy_relation_tokens": enemy_tokens,
+            "ally_base_logits": ally_base_logits,
+            "enemy_base_logits": enemy_base_logits,
+            "ally_base_mask": ally_base_mask,
+            "enemy_base_mask": enemy_base_mask,
+            "ally_final_mask": ally_final_mask,
+            "enemy_final_mask": enemy_final_mask,
+            "ally_hard_mask": ally_hard,
+            "enemy_hard_mask": enemy_hard,
+            "ally_soft_mask": ally_soft,
+            "enemy_soft_mask": enemy_soft,
+            "ally_valid_mask": ally_candidate_valid,
+            "enemy_valid_mask": enemy_candidate_valid,
+            "ally_operation_logits": ally_ops["operation_logits"],
+            "enemy_operation_logits": enemy_ops["operation_logits"],
+            "ally_operation_valid": ally_ops["valid_operations"],
+            "enemy_operation_valid": enemy_ops["valid_operations"],
+            "ally_operation": ally_ops,
+            "enemy_operation": enemy_ops,
+            "ally_diffusion_loss": agent_state.new_tensor(0.0),
+            "enemy_diffusion_loss": agent_state.new_tensor(0.0),
+            "total_diffusion_loss": agent_state.new_tensor(0.0),
+            "ally_valid_count": ally_candidate_valid.sum(-1).float().mean().detach(),
+            "enemy_valid_count": enemy_candidate_valid.sum(-1).float().mean().detach(),
+            "ally_selected_count": ally_hard.sum(-1).float().mean().detach(),
+            "enemy_selected_count": enemy_hard.sum(-1).float().mean().detach(),
+            "ally_swap_rate": ally_swap.float().mean().detach(),
+            "enemy_swap_rate": enemy_swap.float().mean().detach(),
+            "ally_noop_rate": (~ally_swap).float().mean().detach(),
+            "enemy_noop_rate": (~enemy_swap).float().mean().detach(),
+            "ally_soft_budget_error": (ally_soft.sum(-1) - ally_base_mask.sum(-1)).abs().detach(),
+            "enemy_soft_budget_error": (enemy_soft.sum(-1) - enemy_base_mask.sum(-1)).abs().detach(),
+            "fusion_gates": gates,
+        }
+        return features, latent_beliefs, (gates[:, 0:1].expand(-1, H), gates[:, 1:2].expand(-1, H), gates[:, 2:3].expand(-1, H))
+
     def forward(self, agent_state, ally_obs, enemy_obs, ctx_obs,
                 ally_mask=None, enemy_mask=None, ctx_mask=None):
         """
@@ -931,6 +1174,9 @@ class HeteroGraphActorBase(nn.Module):
             Q_2, K_2, V_2, mask_2, self.head_dim2
         )                                                                      # Shape: [B, H], [B, N_enemy+N_ctx]
         m_threat = self.linear_out2(m_threat_raw)                              # Shape: [B, H]
+
+        if self.use_gsd_bsd:
+            return self._gsd_bsd_forward(agent_state, ally_obs, enemy_obs, ally_valid, enemy_valid, m_ally, m_threat, attn_threat)
 
         # Hop 3: Cooperative Teammate Selection, ego + threat attends over filtered allies.
         N_ally = ally_obs.shape[1]

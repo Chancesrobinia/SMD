@@ -415,5 +415,36 @@ def get_config():
                         help="Print SMD tensor shapes once.")
     parser.add_argument("--smd_log_interval", type=int, default=1000,
                         help="Reserved SMD logging interval.")
+    parser.add_argument("--use_gsd_bsd", action='store_true', default=False,
+                        help="Enable GSD-BSD budget-preserving subgraph diffusion.")
+    parser.add_argument("--gsd_bsd_ally_candidate_k", type=int, default=4)
+    parser.add_argument("--gsd_bsd_enemy_candidate_k", type=int, default=4)
+    parser.add_argument("--gsd_bsd_ally_edge_m", type=int, default=2)
+    parser.add_argument("--gsd_bsd_enemy_edge_m", type=int, default=1)
+    parser.add_argument("--gsd_bsd_hidden_dim", type=int, default=64)
+    parser.add_argument("--gsd_bsd_num_heads", type=int, default=2)
+    parser.add_argument("--gsd_bsd_num_layers", type=int, default=1)
+    parser.add_argument("--gsd_bsd_type_embedding_dim", type=int, default=8)
+    parser.add_argument("--gsd_bsd_state_embedding_dim", type=int, default=8)
+    parser.add_argument("--gsd_bsd_time_embedding_dim", type=int, default=16)
+    parser.add_argument("--gsd_bsd_denoise_steps", type=int, default=1)
+    parser.add_argument("--gsd_bsd_num_ally_swap_candidates", type=int, default=4)
+    parser.add_argument("--gsd_bsd_num_enemy_swap_candidates", type=int, default=4)
+    parser.add_argument("--gsd_bsd_num_joint_candidates", type=int, default=4)
+    parser.add_argument("--gsd_bsd_target_source", type=str, default="ppo_surrogate",
+                        choices=["ppo_surrogate", "base_graph"])
+    parser.add_argument("--gsd_bsd_target_improvement_margin", type=float, default=0.0)
+    parser.add_argument("--gsd_bsd_target_search_interval", type=int, default=1)
+    parser.add_argument("--gsd_bsd_target_batch_fraction", type=float, default=1.0)
+    parser.add_argument("--gsd_bsd_use_st_mask", action='store_true', default=True)
+    parser.add_argument("--gsd_bsd_disable_st_mask", action='store_false', dest="gsd_bsd_use_st_mask")
+    parser.add_argument("--gsd_bsd_warmup_steps", type=int, default=0)
+    parser.add_argument("--gsd_bsd_update_interval", type=int, default=1)
+    parser.add_argument("--lambda_gsd_bsd_diff", type=float, default=0.01)
+    parser.add_argument("--lambda_gsd_bsd_noop", type=float, default=1.0)
+    parser.add_argument("--lambda_gsd_bsd_action_consistency", type=float, default=0.0)
+    parser.add_argument("--gsd_bsd_enemy_base_score_source", type=str, default="auto",
+                        choices=["auto", "hop2", "learned", "distance"])
+    parser.add_argument("--gsd_bsd_debug", action='store_true', default=False)
 
     return parser

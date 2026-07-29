@@ -135,6 +135,17 @@ class R_MAPPOPolicy:
         values, _ = self.critic(cent_obs, rnn_states_critic, masks)
         return values, action_log_probs, dist_entropy, smd_aux
 
+    def evaluate_actions_with_gsd_bsd(self, cent_obs, obs, rnn_states_actor, rnn_states_critic, action, masks,
+                                      available_actions=None, active_masks=None):
+        """
+        Like evaluate_actions but also returns GSD-BSD auxiliary tensors.
+        """
+        action_log_probs, dist_entropy, bsd_aux = self.actor.evaluate_actions_with_gsd_bsd(
+            obs, rnn_states_actor, action, masks, available_actions, active_masks)
+
+        values, _ = self.critic(cent_obs, rnn_states_critic, masks)
+        return values, action_log_probs, dist_entropy, bsd_aux
+
     def act(self, obs, rnn_states_actor, masks, available_actions=None, deterministic=False):
         """
         Compute actions using the given inputs.
