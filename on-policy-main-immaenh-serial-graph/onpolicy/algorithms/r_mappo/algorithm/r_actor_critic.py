@@ -13,6 +13,7 @@ from onpolicy.algorithms.utils.hetero_graph import (
     HeteroGraphActorBase,
     ParallelAllyEntityGraphActorBase,
 )
+from onpolicy.algorithms.utils.smac_obs_adapter import SMACHeteroObservationAdapter
 from onpolicy.utils.util import get_shape_from_obs_space
 
 
@@ -42,7 +43,13 @@ class R_Actor(nn.Module):
         self._use_hetero_graph = getattr(args, 'use_hetero_graph', False)
         self._use_parallel_ally_graph = getattr(args, 'use_parallel_ally_graph', False)
         self._use_entity_enemy_first_graph = getattr(args, 'use_entity_enemy_first_graph', False)
+        self.env_name = getattr(args, 'env_name', None)
         self.scenario_name = getattr(args, 'scenario_name', None)
+        self._use_smac_hetero = (
+            self._use_hetero_graph
+            and self.env_name == 'StarCraft2'
+            and obs_space.__class__.__name__ == 'list'
+        )
         self._use_world_comm_hetero = (
             self._use_hetero_graph and self.scenario_name == 'simple_world_comm'
         )
@@ -59,6 +66,8 @@ class R_Actor(nn.Module):
         self._use_knn = getattr(args, 'use_knn', True)
         self._use_am_filter = getattr(args, 'use_am_filter', True)
         self._use_smd = getattr(args, 'use_smd', False)
+        self._smd_debug_shapes = getattr(args, 'smd_debug_shapes', False)
+        self._smd_debug_printed = False
         self._use_gsd_bsd = getattr(args, 'use_gsd_bsd', False)
         if self._use_smd and self._use_gsd_bsd:
             raise RuntimeError("use_smd and use_gsd_bsd cannot be enabled together")
@@ -68,17 +77,41 @@ class R_Actor(nn.Module):
         # Mode A: Heterogeneous Dual-Graph
         # ============================================================
         if self._use_hetero_graph:
-            self.agent_state_dim = getattr(args, 'agent_state_dim', 4)
-            self.landmark_dim    = getattr(args, 'landmark_dim', 2)
-            self.num_neighbors   = getattr(args, 'num_neighbors', None)  # inferred at runtime if None
-            self.neighbor_dim    = getattr(args, 'neighbor_dim', 4)
+            self.smac_adapter = None
+            if self._use_smac_hetero:
+                if getattr(args, 'use_stacked_frames', False):
+                    raise NotImplementedError(
+                        "SMAC SMD adapter does not support stacked_frames yet."
+                    )
+                self.smac_adapter = SMACHeteroObservationAdapter(
+                    obs_space,
+                    debug_shapes=getattr(args, 'smd_debug_shapes', False),
+                )
+                self.smac_obs_dim = self.smac_adapter.obs_dim
+                self.smac_n_allies = self.smac_adapter.n_allies
+                self.smac_ally_raw_dim = self.smac_adapter.ally_raw_dim
+                self.smac_n_enemies = self.smac_adapter.n_enemies
+                self.smac_enemy_raw_dim = self.smac_adapter.enemy_raw_dim
+                self.smac_move_dim = self.smac_adapter.move_dim
+                self.smac_own_extra_dim = self.smac_adapter.own_extra_dim
+                self.agent_state_dim = self.smac_adapter.agent_state_dim
+                self.landmark_dim = 1
+                self.num_neighbors = self.smac_n_allies
+                self.neighbor_dim = self.smac_ally_raw_dim
+            else:
+                self.agent_state_dim = getattr(args, 'agent_state_dim', 4)
+                self.landmark_dim    = getattr(args, 'landmark_dim', 2)
+                self.num_neighbors   = getattr(args, 'num_neighbors', None)  # inferred at runtime if None
+                self.neighbor_dim    = getattr(args, 'neighbor_dim', 4)
             self.num_agents      = getattr(args, 'num_agents', None)
             self.num_good_agents = getattr(args, 'num_good_agents', 2)
             self.num_adversaries = getattr(args, 'num_adversaries', 4)
             self.num_forests     = getattr(args, 'num_forests', 2)
             self.num_entities    = getattr(args, 'num_entities', None)
 
-            if self._use_world_comm_hetero:
+            if self._use_smac_hetero:
+                self.num_landmarks = 0
+            elif self._use_world_comm_hetero:
                 self.num_landmarks = self.num_entities or getattr(args, 'num_landmarks', 1)
                 self.num_food = max(self.num_landmarks - getattr(args, 'num_landmarks', 1) - self.num_forests, 0)
                 expected_agent_state_dim = 4 + self.num_forests + self.num_good_agents
@@ -156,9 +189,15 @@ class R_Actor(nn.Module):
                 agent_state_dim=self.agent_state_dim,
                 landmark_dim=self.landmark_dim,
                 neighbor_dim=self.neighbor_dim,
-                ally_dim=self.neighbor_dim,
-                enemy_dim=self.neighbor_dim,
-                ctx_dim=self.landmark_dim,
+                ally_dim=(
+                    self.smac_ally_raw_dim
+                    if self._use_smac_hetero else self.neighbor_dim
+                ),
+                enemy_dim=(
+                    self.smac_enemy_raw_dim
+                    if self._use_smac_hetero else self.neighbor_dim
+                ),
+                ctx_dim=1 if self._use_smac_hetero else self.landmark_dim,
                 hidden_size=self.hidden_size,
                 use_orthogonal=self._use_orthogonal,
                 use_ReLU=getattr(args, 'use_ReLU', True),
@@ -222,6 +261,9 @@ class R_Actor(nn.Module):
     # ==================================================================
     # Observation parsers
     # ==================================================================
+    def _split_smac_hetero_obs(self, obs):
+        return self.smac_adapter(obs)
+
     def _pad_last_dim(self, x, target_dim):
         if x.shape[-1] == target_dim:
             return x
@@ -580,7 +622,32 @@ class R_Actor(nn.Module):
     def _extract_features(self, obs):
         """Return (actor_features, latent_beliefs).  latent_beliefs may be None."""
         if self._use_hetero_graph:
-            if self._use_world_comm_hetero:
+            if self._use_smac_hetero:
+                agent_state, ally_obs, enemy_obs, ctx_obs, ally_mask, enemy_mask, ctx_mask = self._split_smac_hetero_obs(obs)
+                graph_out = self.base(
+                    agent_state, ally_obs, enemy_obs, ctx_obs, ally_mask, enemy_mask, ctx_mask
+                )
+                if self._use_smd and self._smd_debug_shapes and not self._smd_debug_printed:
+                    smd_aux = getattr(self.base, "last_smd_aux", {})
+                    candidate_count = min(
+                        (
+                            self.base.smd_candidate_top_k
+                            if self.base.use_knn else ally_obs.shape[1]
+                        ),
+                        ally_obs.shape[1],
+                    )
+                    print("[SMD]")
+                    print(
+                        "candidate_ally      ",
+                        (ally_obs.shape[0], candidate_count, ally_obs.shape[2]),
+                    )
+                    print("candidate_mask      ", tuple(smd_aux["candidate_mask"].shape))
+                    print("edge_logits         ", tuple(smd_aux["edge_logits"].shape))
+                    print("edge_probs          ", tuple(smd_aux["edge_probs"].shape))
+                    print("hard_mask           ", tuple(smd_aux["hard_mask"].shape))
+                    print("edge_context        ", tuple(smd_aux["edge_context"].shape))
+                    self._smd_debug_printed = True
+            elif self._use_world_comm_hetero:
                 agent_state, ally_obs, enemy_obs, ctx_obs, ally_mask, enemy_mask, ctx_mask = self._split_world_comm_hetero_obs(obs)
                 graph_out = self.base(
                     agent_state, ally_obs, enemy_obs, ctx_obs, ally_mask, enemy_mask, ctx_mask

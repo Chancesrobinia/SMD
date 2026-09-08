@@ -47,6 +47,8 @@ class R_MAPPO():
         self._use_am_filter = getattr(args, 'use_am_filter', True)
         self.recon_loss_coef = getattr(args, 'recon_loss_coef', 0.01)
         self._use_smd = getattr(args, 'use_smd', False)
+        self._smd_debug_shapes = getattr(args, 'smd_debug_shapes', False)
+        self._smd_grad_debug_printed = False
         self._use_gsd_bsd = getattr(args, 'use_gsd_bsd', False)
         self.lambda_gsd_bsd_diff = getattr(args, 'lambda_gsd_bsd_diff', 0.01)
         self.lambda_gsd_bsd_noop = getattr(args, 'lambda_gsd_bsd_noop', 1.0)
@@ -434,6 +436,29 @@ class R_MAPPO():
         if update_actor:
             total_actor_loss = policy_loss - dist_entropy * self.entropy_coef + recon_loss * self.recon_loss_coef + smd_loss + gsd_bsd_loss
             total_actor_loss.backward()
+
+        if self._use_smd and self._smd_debug_shapes and not self._smd_grad_debug_printed:
+            base = getattr(self.policy.actor, 'base', None)
+
+            def _module_grad_norm(module):
+                if module is None:
+                    return 0.0
+                squared_norm = 0.0
+                for param in module.parameters():
+                    if param.grad is not None:
+                        squared_norm += float(param.grad.detach().norm().item() ** 2)
+                return squared_norm ** 0.5
+
+            student_grad_norm = _module_grad_norm(
+                getattr(base, 'student_mask_head', None)
+            )
+            teacher_grad_norm = _module_grad_norm(
+                getattr(base, 'smd_teacher', None)
+            )
+            print("[SMD Gradients]")
+            print("student_grad_norm    ", student_grad_norm)
+            print("teacher_grad_norm    ", teacher_grad_norm)
+            self._smd_grad_debug_printed = True
 
         if self._use_max_grad_norm:
             actor_grad_norm = nn.utils.clip_grad_norm_(self.policy.actor.parameters(), self.max_grad_norm)

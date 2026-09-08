@@ -213,13 +213,26 @@ def main(args):
 
     if all_args.env_name == "SMAC":
         from smac.env.starcraft2.maps import get_map_params
-        num_agents = get_map_params(all_args.map_name)["n_agents"]
+        map_params = get_map_params(all_args.map_name)
+        num_agents = map_params["n_agents"]
+        num_enemies = map_params["n_enemies"]
     elif all_args.env_name == 'StarCraft2':
         from onpolicy.envs.starcraft2.smac_maps import get_map_params
-        num_agents = get_map_params(all_args.map_name)["n_agents"]
+        map_params = get_map_params(all_args.map_name)
+        num_agents = map_params["n_agents"]
+        num_enemies = map_params["n_enemies"]
     elif all_args.env_name == "SMACv2" or all_args.env_name == 'StarCraft2v2':
-        from smacv2.env.starcraft2.maps import get_map_params
-        num_agents = parse_smacv2_distribution(all_args)['n_units']
+        distribution = parse_smacv2_distribution(all_args)
+        num_agents = distribution["n_units"]
+        num_enemies = distribution["n_enemies"]
+    else:
+        raise NotImplementedError(
+            "Unsupported SMAC environment for map metadata: {}"
+            .format(all_args.env_name)
+        )
+
+    all_args.num_agents = num_agents
+    all_args.num_enemies = num_enemies
 
     config = {
         "all_args": all_args,
