@@ -71,7 +71,7 @@ class R_Actor(nn.Module):
             self.agent_state_dim = getattr(args, 'agent_state_dim', 4)
             self.landmark_dim    = getattr(args, 'landmark_dim', 2)
             self.num_neighbors   = getattr(args, 'num_neighbors', None)  # inferred at runtime if None
-            self.neighbor_dim    = getattr(args, 'neighbor_dim', 4)
+            self.neighbor_dim    = getattr(args, 'neighbor_dim', None) or 4
             self.num_agents      = getattr(args, 'num_agents', None)
             self.num_good_agents = getattr(args, 'num_good_agents', 2)
             self.num_adversaries = getattr(args, 'num_adversaries', 4)
