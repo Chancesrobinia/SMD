@@ -645,6 +645,9 @@ class HeteroGraphActorBase(nn.Module):
         ally_dim=None,
         enemy_dim=None,
         ctx_dim=None,
+        synergy_temperature=1.0,
+        self_residual=False,
+        self_residual_scale=1.0,
     ):
         super(HeteroGraphActorBase, self).__init__()
         self.agent_state_dim = agent_state_dim
@@ -659,8 +662,10 @@ class HeteroGraphActorBase(nn.Module):
         self.use_knn = use_knn
         self.use_am_filter = use_am_filter
         self.use_gated_fusion = use_gated_fusion
+        self.synergy_temperature = synergy_temperature
         self.last_g_intent = None
         self.last_g_refined = None
+        self.last_synergy_hard_mask = None
 
         H = hidden_size
         act_fn = nn.ReLU() if use_ReLU else nn.Tanh()
@@ -712,6 +717,27 @@ class HeteroGraphActorBase(nn.Module):
             )
             self._init_fusion(use_orthogonal, use_ReLU)
 
+        self.self_residual = bool(self_residual)
+        if self.self_residual:
+            self.self_proj = nn.Linear(agent_state_dim, H)
+            self.self_residual_norm = nn.LayerNorm(H)
+            self.self_residual_scale = nn.Parameter(
+                torch.tensor(float(self_residual_scale)))
+            if use_orthogonal:
+                nn.init.orthogonal_(
+                    self.self_proj.weight,
+                    gain=nn.init.calculate_gain('relu' if use_ReLU else 'tanh'))
+            else:
+                nn.init.xavier_uniform_(self.self_proj.weight)
+            nn.init.constant_(self.self_proj.bias, 0.0)
+
+    def _apply_self_residual(self, features, agent_state):
+        """Optional ablation branch; identity unless --hetero_self_residual."""
+        if not self.self_residual:
+            return features
+        return self.self_residual_norm(
+            features + self.self_residual_scale * self.self_proj(agent_state))
+
     def _init_fusion(self, use_orthogonal, use_ReLU):
         gain = nn.init.calculate_gain('relu' if use_ReLU else 'tanh')
         for m in self.fusion_mlp.modules():
@@ -748,7 +774,8 @@ class HeteroGraphActorBase(nn.Module):
             return ~mask
         return mask > 0
 
-    def _masked_attention_from_projected(self, Q, K, V, valid_mask, head_dim):
+    def _masked_attention_from_projected(self, Q, K, V, valid_mask, head_dim,
+                                         select_weight=None):
         B = Q.shape[0]
         S = K.shape[-2]
         if S == 0:
@@ -770,6 +797,11 @@ class HeteroGraphActorBase(nn.Module):
             denom = attn.sum(dim=-1, keepdim=True).clamp_min(1e-12)           # Shape: [B, Nh, 1, 1]
             attn = attn / denom                                               # Shape: [B, Nh, 1, S]
 
+        if select_weight is not None:
+            attn = attn * select_weight[:, None, None, :].to(dtype=attn.dtype)  # Shape: [B, Nh, 1, S]
+            denom = attn.sum(dim=-1, keepdim=True).clamp_min(1e-12)            # Shape: [B, Nh, 1, 1]
+            attn = attn / denom                                               # Shape: [B, Nh, 1, S]
+
         out = torch.matmul(attn, V)                                           # Shape: [B, Nh, 1, Dh]
         out = out.transpose(1, 2).contiguous().view(B, self.hidden_size)       # Shape: [B, H]
         if valid_mask is not None:
@@ -777,8 +809,65 @@ class HeteroGraphActorBase(nn.Module):
         attn_mean = attn.squeeze(2).mean(dim=1)                               # Shape: [B, S]
         return out, attn_mean
 
+    @staticmethod
+    def _budgeted_soft_mask(logits, valid, budget, temperature=1.0, n_iter=20):
+        """
+        Differentiable relaxation of "select exactly ``budget`` of ``logits``".
+
+        Returns soft in [0,1] with padding exactly 0 and, per row,
+        ``soft.sum(-1) ~= budget``. The threshold tau is found by a vectorised
+        bisection (no per-sample Python loop); tau is treated as a constant so
+        the gradient flows through ``logits`` only.
+        """
+        neg_inf = torch.finfo(logits.dtype).min
+        safe = logits.masked_fill(~valid, neg_inf)                             # Shape: [B, K]
+        budget_f = budget.to(dtype=logits.dtype)                               # Shape: [B]
+
+        with torch.no_grad():
+            finite = logits.masked_fill(~valid, 0.0)
+            lo = finite.min(dim=-1, keepdim=True).values - 10.0 * temperature   # Shape: [B, 1]
+            hi = finite.max(dim=-1, keepdim=True).values + 10.0 * temperature   # Shape: [B, 1]
+            for _ in range(n_iter):
+                mid = 0.5 * (lo + hi)                                          # Shape: [B, 1]
+                total = torch.sigmoid((safe - mid) / temperature)
+                total = (total * valid.to(dtype=logits.dtype)).sum(dim=-1, keepdim=True)
+                too_many = total > budget_f.unsqueeze(-1)
+                lo = torch.where(too_many, mid, lo)
+                hi = torch.where(too_many, hi, mid)
+            tau = 0.5 * (lo + hi)                                              # Shape: [B, 1]
+
+        soft = torch.sigmoid((safe - tau) / temperature)                        # Shape: [B, K]
+        return soft * valid.to(dtype=logits.dtype)
+
+    def _straight_through_topk(self, logits, valid, k_filter):
+        """
+        Hard Top-K forward, soft-budget gradient backward.
+
+        ``st = hard.detach() - soft.detach() + soft`` so the forward value is
+        exactly the hard 0/1 Top-K mask while d st/d logits = d soft/d logits,
+        which is what restores PPO gradient flow into ``synergy_mlp``.
+        """
+        valid_count = valid.sum(dim=-1)                                        # Shape: [B]
+        budget = torch.clamp(valid_count, max=k_filter)                        # Shape: [B]
+
+        neg_inf = torch.finfo(logits.dtype).min
+        masked = logits.masked_fill(~valid, neg_inf)                           # Shape: [B, K]
+        order = masked.argsort(dim=-1, descending=True)                        # Shape: [B, K]
+        rank = torch.empty_like(order)
+        rank.scatter_(1, order, torch.arange(
+            logits.shape[-1], device=logits.device
+        ).expand_as(order))                                                    # Shape: [B, K]
+        hard = (rank < budget.unsqueeze(-1)) & valid                           # Shape: [B, K]
+        hard = hard.to(dtype=logits.dtype)
+
+        soft = self._budgeted_soft_mask(
+            logits, valid, budget, temperature=self.synergy_temperature
+        )                                                                      # Shape: [B, K]
+        return hard.detach() - soft.detach() + soft, hard
+
     def forward(self, agent_state, ally_obs, enemy_obs, ctx_obs,
-                ally_mask=None, enemy_mask=None, ctx_mask=None):
+                ally_mask=None, enemy_mask=None, ctx_mask=None,
+                ally_distance=None):
         """
         Args:
             agent_state: [B, d_agent]
@@ -786,6 +875,9 @@ class HeteroGraphActorBase(nn.Module):
             enemy_obs:   [B, N_enemy, d_enemy]
             ctx_obs:     [B, N_ctx, d_ctx]
             *_mask: bool masks use True as invalid padding; numeric masks use >0 as valid.
+            ally_distance: optional [B, N_ally] explicit ego-ally distance used for
+                KNN. When None the legacy MPE convention (ally feats 0,1 = dx,dy)
+                is used. Keeps the graph core environment-agnostic.
 
         Returns:
             features:       [B, hidden_size]
@@ -844,7 +936,10 @@ class HeteroGraphActorBase(nn.Module):
         else:
             if ally_valid is None:
                 ally_valid = agent_state.new_ones(B, N_ally, dtype=torch.bool) # Shape: [B, N_ally]
-            dist_sq = ally_obs[:, :, 0] ** 2 + ally_obs[:, :, 1] ** 2          # Shape: [B, N_ally]
+            if ally_distance is None:
+                dist_sq = ally_obs[:, :, 0] ** 2 + ally_obs[:, :, 1] ** 2      # Shape: [B, N_ally]
+            else:
+                dist_sq = ally_distance                                        # Shape: [B, N_ally]
             dist_sq = dist_sq.masked_fill(~ally_valid, float('inf'))           # Shape: [B, N_ally]
             effective_k = min(self.k_max if self.use_knn else N_ally, N_ally)
             _, knn_idx = torch.topk(
@@ -856,23 +951,22 @@ class HeteroGraphActorBase(nn.Module):
             )                                                                  # Shape: [B, k_max, d_ally]
             knn_valid = torch.gather(ally_valid, dim=1, index=knn_idx)         # Shape: [B, k_max]
 
+            # Keep every KNN candidate as a tensor. Selection is expressed as a
+            # multiplicative mask over attention rather than an integer gather,
+            # otherwise no gradient can reach synergy_mlp.
+            select_weight = None
             if self.use_am_filter:
                 threat_expand = m_threat.unsqueeze(1).expand(-1, effective_k, -1)  # Shape: [B, k_max, H]
                 synergy_in = torch.cat([threat_expand, knn_obs], dim=-1)       # Shape: [B, k_max, H+d_ally]
-                synergy_score = self.synergy_mlp(synergy_in).squeeze(-1)       # Shape: [B, k_max]
-                synergy_score = synergy_score.masked_fill(~knn_valid, -1e9)   # Shape: [B, k_max]
+                synergy_logits = self.synergy_mlp(synergy_in).squeeze(-1)      # Shape: [B, k_max]
                 filter_k = min(self.top_k_filter, effective_k)
-                _, filter_idx = torch.topk(
-                    synergy_score, k=filter_k, dim=-1, largest=True
-                )                                                              # Shape: [B, k_filter]
-                filtered_ally = torch.gather(
-                    knn_obs, dim=1,
-                    index=filter_idx.unsqueeze(-1).expand(-1, -1, self.ally_dim)
-                )                                                              # Shape: [B, k_filter, d_ally]
-                filtered_valid = torch.gather(knn_valid, dim=1, index=filter_idx)  # Shape: [B, k_filter]
-            else:
-                filtered_ally = knn_obs                                        # Shape: [B, k_max, d_ally]
-                filtered_valid = knn_valid                                     # Shape: [B, k_max]
+                st_mask, hard_mask = self._straight_through_topk(
+                    synergy_logits, knn_valid, filter_k
+                )                                                              # Shape: [B, k_max], [B, k_max]
+                select_weight = hard_mask if not torch.is_grad_enabled() else st_mask
+                self.last_synergy_hard_mask = hard_mask
+            filtered_ally = knn_obs                                            # Shape: [B, k_max, d_ally]
+            filtered_valid = knn_valid                                         # Shape: [B, k_max]
 
             q_coop = torch.cat([agent_state, m_threat], dim=-1)                # Shape: [B, d_agent+H]
             Q_3 = self.linear_q3(q_coop).view(
@@ -885,8 +979,9 @@ class HeteroGraphActorBase(nn.Module):
                 B, filtered_ally.shape[1], self.num_heads3, self.head_dim3
             ).transpose(1, 2)                                                  # Shape: [B, heads, k_filter, head_dim]
             m_coop_raw, attn_coop = self._masked_attention_from_projected(
-                Q_3, K_3, V_3, filtered_valid, self.head_dim3
-            )                                                                  # Shape: [B, H], [B, k_filter]
+                Q_3, K_3, V_3, filtered_valid, self.head_dim3,
+                select_weight=select_weight
+            )                                                                  # Shape: [B, H], [B, k_max]
             m_coop = self.linear_out3(m_coop_raw)                              # Shape: [B, H]
 
         # Terminal gated fusion: threat intent + cooperative teammate feature.
@@ -901,6 +996,8 @@ class HeteroGraphActorBase(nn.Module):
             features = self.fusion_mlp(fused)                                  # Shape: [B, H]
             self.last_g_intent = None
             self.last_g_refined = None
+
+        features = self._apply_self_residual(features, agent_state)            # Shape: [B, H]
 
         max_pool = max(attn_threat.shape[1], attn_coop.shape[1])
 

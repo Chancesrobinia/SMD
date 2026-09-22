@@ -120,7 +120,15 @@ def parse_args(args, parser):
     parser.add_argument("--use_mustalive", action='store_false', default=True)
     parser.add_argument("--add_center_xy", action='store_false', default=True)
 
-    all_args = parser.parse_known_args(args)[0]
+    all_args, unknown = parser.parse_known_args(args)
+    if unknown:
+        raise ValueError(
+            "Unknown command line arguments: {}. A misspelled flag such as "
+            "--ally_faet_dim would otherwise be dropped silently and train a "
+            "differently-shaped model. SMAC HeteroGraph derives all graph "
+            "dimensions from the environment, so per-map dimension flags "
+            "(--n_allies / --ally_feat_dim / --agent_state_dim / ...) are no "
+            "longer accepted.".format(' '.join(unknown)))
 
     return all_args
 

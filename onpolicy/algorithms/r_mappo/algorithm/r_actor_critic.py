@@ -13,6 +13,7 @@ from onpolicy.algorithms.utils.hetero_graph import (
     HeteroGraphActorBase,
     ParallelAllyEntityGraphActorBase,
 )
+from onpolicy.algorithms.utils.smac_obs_spec import SMACObsSpec
 from onpolicy.utils.util import get_shape_from_obs_space
 
 
@@ -77,26 +78,24 @@ class R_Actor(nn.Module):
             self.num_forests     = getattr(args, 'num_forests', 2)
             self.num_entities    = getattr(args, 'num_entities', None)
 
-            # SMAC-specific dimensions
+            # SMAC dimensions are derived from the environment's own structured
+            # observation metadata, never from CLI flags or a map-name table.
             if self._use_smac_hetero:
-                self.n_allies = getattr(args, 'n_allies', self.num_agents - 1 if self.num_agents else 0)
-                self.n_enemies = getattr(args, 'n_enemies', self.n_allies)
-                self.ally_feat_dim = getattr(args, 'ally_feat_dim', self.neighbor_dim)
-                self.enemy_feat_dim = getattr(args, 'enemy_feat_dim', self.neighbor_dim)
-                self.move_feat_dim = getattr(args, 'move_feat_dim', 4)
-                self.own_feat_dim = getattr(args, 'own_feat_dim', 4)
+                if getattr(args, 'use_stacked_frames', False) or getattr(args, 'stacked_frames', 1) > 1:
+                    raise RuntimeError(
+                        "SMAC HeteroGraph does not yet support stacked observations")
 
-                # For SMAC, agent_state_dim needs to be computed from actual observation structure
-                # agent_state = remaining obs after allies and enemies = move_feats + own_feats + agent_id
-                total_obs_dim = obs_shape[0] if isinstance(obs_shape, (list, tuple)) else obs_shape
-                ally_total = self.n_allies * self.ally_feat_dim
-                enemy_total = self.n_enemies * self.enemy_feat_dim
-                computed_agent_state_dim = total_obs_dim - ally_total - enemy_total
-
-                # Override agent_state_dim with computed value
-                self.agent_state_dim = computed_agent_state_dim
-                print(f"SMAC HeteroGraph: Computed agent_state_dim={self.agent_state_dim} "
-                      f"(total_obs={total_obs_dim}, allies={ally_total}, enemies={enemy_total})")
+                self.smac_obs_spec = SMACObsSpec.from_obs_space(
+                    obs_space, env_name=getattr(args, 'env_name', None))
+                spec = self.smac_obs_spec
+                self.n_allies = spec.n_allies
+                self.n_enemies = spec.n_enemies
+                self.ally_feat_dim = spec.ally_feat_dim
+                self.enemy_feat_dim = spec.enemy_feat_dim
+                self.move_feat_dim = spec.move_feat_dim
+                self.own_feat_dim = spec.own_feat_dim
+                self.agent_state_dim = spec.agent_state_dim
+                self._smac_spec_logged = False
 
             if self._use_world_comm_hetero:
                 self.num_landmarks = self.num_entities or getattr(args, 'num_landmarks', 1)
@@ -124,13 +123,24 @@ class R_Actor(nn.Module):
                 graph_base_cls = EntityEnemyFirstGraphActorBase
             else:
                 graph_base_cls = HeteroGraphActorBase
+            # SMAC ally/enemy feature widths genuinely differ, so they must not
+            # be collapsed onto neighbor_dim (which stays for MPE/ESMG).
+            if self._use_smac_hetero:
+                ally_dim = self.smac_obs_spec.ally_feat_dim
+                enemy_dim = self.smac_obs_spec.enemy_feat_dim
+                ctx_dim = self.smac_obs_spec.ctx_dim
+            else:
+                ally_dim = self.neighbor_dim
+                enemy_dim = self.neighbor_dim
+                ctx_dim = self.landmark_dim
+
             self.base = graph_base_cls(
                 agent_state_dim=self.agent_state_dim,
                 landmark_dim=self.landmark_dim,
                 neighbor_dim=self.neighbor_dim,
-                ally_dim=self.neighbor_dim,
-                enemy_dim=self.neighbor_dim,
-                ctx_dim=self.landmark_dim,
+                ally_dim=ally_dim,
+                enemy_dim=enemy_dim,
+                ctx_dim=ctx_dim,
                 hidden_size=self.hidden_size,
                 use_orthogonal=self._use_orthogonal,
                 use_ReLU=getattr(args, 'use_ReLU', True),
@@ -140,7 +150,11 @@ class R_Actor(nn.Module):
                     top_k_filter=getattr(args, 'top_k_filter', 5),
                     use_knn=self._use_knn,
                     use_am_filter=self._use_am_filter,
-                ))
+                )),
+                **(dict(
+                    self_residual=getattr(args, 'hetero_self_residual', False),
+                    self_residual_scale=getattr(args, 'hetero_self_residual_scale', 1.0),
+                ) if graph_base_cls is HeteroGraphActorBase else {})
             )
 
         # ============================================================
@@ -471,84 +485,82 @@ class R_Actor(nn.Module):
 
     def _split_smac_hetero_obs(self, obs):
         """
-        Parse SMAC observations for heterograph module.
+        Parse a classic SMAC observation into heterograph inputs.
 
-        SMAC observation structure:
-            [ally_feats(n_allies * ally_feat_dim) | enemy_feats(n_enemies * enemy_feat_dim) |
-             move_feats(move_feat_dim) | own_feats(own_feat_dim) | agent_id(n_agents)]
+        Layout (StarCraft2Env.get_obs_agent):
+            [ally_feats | enemy_feats | move_feats | own_feats(+agent_id)(+timestep)]
 
-        For heterograph, we need:
-            - agent_state: own features + move features (inferred from remaining obs)
-            - ally_obs: ally features
-            - enemy_obs: enemy features
-            - ctx_obs: environment context (use move features as context)
-            - masks for valid allies/enemies/context
-
-        Returns:
-            agent_state:  [B, agent_state_dim]
-            ally_obs:     [B, n_allies, ally_dim]
-            enemy_obs:    [B, n_enemies, enemy_dim]
-            ctx_obs:      [B, 1, ctx_dim] (using move features as context)
-            ally_mask:    [B, n_allies] (True = invalid/dead)
-            enemy_mask:   [B, n_enemies] (True = invalid/dead)
-            ctx_mask:     [B, 1] (all valid)
+        Returns bool ``*_mask`` where True means invalid, matching the existing
+        heterograph boundary convention. Validity is computed as ``*_valid``
+        and inverted exactly once, at the return.
         """
+        spec = self.smac_obs_spec
         B = obs.shape[0]
-        total_obs_dim = obs.shape[1]
 
-        # Get dimensions from environment info stored during init
-        n_allies = getattr(self, 'n_allies', self.num_agents - 1 if self.num_agents else 0)
-        n_enemies = getattr(self, 'n_enemies', n_allies)
-        ally_feat_dim = getattr(self, 'ally_feat_dim', self.neighbor_dim)
-        enemy_feat_dim = getattr(self, 'enemy_feat_dim', self.neighbor_dim)
+        if obs.shape[-1] != spec.total_dim:
+            raise RuntimeError(
+                "SMAC HeteroGraph observation width mismatch: got {}, spec "
+                "expects {}. Spec: {}".format(obs.shape[-1], spec.total_dim, spec))
 
         idx = 0
 
-        # Parse ally features
-        ally_total = n_allies * ally_feat_dim
-        if ally_total > 0:
-            ally_flat = obs[:, idx:idx + ally_total]
-            ally_obs = ally_flat.contiguous().view(B, n_allies, ally_feat_dim)
-            # Ally mask: first feature is 'visible', 0 means dead/invisible
-            ally_mask = (ally_obs[:, :, 0] == 0).to(dtype=torch.bool)
-        else:
-            ally_obs = obs.new_zeros(B, 0, ally_feat_dim)
-            ally_mask = torch.zeros(B, 0, dtype=torch.bool, device=obs.device)
+        ally_total = spec.n_allies * spec.ally_feat_dim
+        ally_obs = obs[:, idx:idx + ally_total].contiguous().view(
+            B, spec.n_allies, spec.ally_feat_dim)
         idx += ally_total
 
-        # Parse enemy features
-        enemy_total = n_enemies * enemy_feat_dim
-        if enemy_total > 0:
-            enemy_flat = obs[:, idx:idx + enemy_total]
-            enemy_obs = enemy_flat.contiguous().view(B, n_enemies, enemy_feat_dim)
-            # Enemy mask: check if visible (distance > 0 or any feature > 0)
-            enemy_visible = (enemy_obs[:, :, 1] > 0) | (enemy_obs[:, :, 2].abs() > 1e-6) | (enemy_obs[:, :, 3].abs() > 1e-6)
-            enemy_mask = ~enemy_visible.to(dtype=torch.bool)
-        else:
-            enemy_obs = obs.new_zeros(B, 0, enemy_feat_dim)
-            enemy_mask = torch.zeros(B, 0, dtype=torch.bool, device=obs.device)
+        enemy_total = spec.n_enemies * spec.enemy_feat_dim
+        enemy_obs = obs[:, idx:idx + enemy_total].contiguous().view(
+            B, spec.n_enemies, spec.enemy_feat_dim)
         idx += enemy_total
 
-        # Everything remaining is agent_state (move_feats + own_feats + possibly agent_id)
-        agent_state = obs[:, idx:]
+        move_feats = obs[:, idx:idx + spec.move_feat_dim]
+        idx += spec.move_feat_dim
 
-        # Debug: Check if actual agent_state dimension matches initialization
-        actual_agent_state_dim = agent_state.shape[1]
-        if actual_agent_state_dim != self.agent_state_dim:
-            print(f"WARNING: agent_state dimension mismatch!")
-            print(f"  Initialized agent_state_dim: {self.agent_state_dim}")
-            print(f"  Actual agent_state dimension: {actual_agent_state_dim}")
-            print(f"  Total obs dim: {total_obs_dim}, n_allies: {n_allies}, n_enemies: {n_enemies}")
-            print(f"  ally_feat_dim: {ally_feat_dim}, enemy_feat_dim: {enemy_feat_dim}")
+        own_and_identity_feats = obs[:, idx:spec.total_dim]
+        idx += own_and_identity_feats.shape[-1]
 
-        # For context, use a small portion of agent_state as a proxy for move features
-        # Take first landmark_dim features as context
-        ctx_dim = getattr(self, 'landmark_dim', 4)
-        ctx_feats = agent_state[:, :ctx_dim] if agent_state.shape[1] >= ctx_dim else agent_state
-        ctx_obs = ctx_feats.unsqueeze(1)  # [B, 1, ctx_dim]
+        if idx != obs.shape[-1]:
+            raise RuntimeError(
+                "SMAC observation parser consumed {} of {} features; the "
+                "structured metadata does not describe this observation. "
+                "Spec: {}".format(idx, obs.shape[-1], spec))
+
+        agent_state = torch.cat([move_feats, own_and_identity_feats], dim=-1)
+        ctx_obs = move_feats.unsqueeze(1)
         ctx_mask = obs.new_ones(B, 1)
 
-        return agent_state, ally_obs, enemy_obs, ctx_obs, ally_mask, enemy_mask, ctx_mask
+        # Ally feature 0 is the visibility flag.
+        if spec.n_allies > 0:
+            ally_valid = ally_obs[..., 0] > 0
+        else:
+            ally_valid = torch.zeros(B, 0, dtype=torch.bool, device=obs.device)
+
+        # Enemy feature 0 is attack availability, NOT visibility: an enemy can be
+        # visible while out of shooting range. Invisible enemies are all-zero.
+        if spec.n_enemies > 0:
+            enemy_valid = enemy_obs.abs().sum(dim=-1) > 1e-6
+        else:
+            enemy_valid = torch.zeros(B, 0, dtype=torch.bool, device=obs.device)
+
+        # Use the environment's own normalised ally distance for KNN instead of
+        # reinterpreting feature 0/1 as (dx, dy).
+        if spec.n_allies > 0 and spec.ally_feat_dim > 1:
+            ally_distance = ally_obs[..., 1]
+        else:
+            ally_distance = None
+
+        if not self._smac_spec_logged:
+            self._smac_spec_logged = True
+            print("[SMAC HeteroGraph] {}".format(spec))
+            print("[SMAC HeteroGraph] agent_state={} ally_obs={} enemy_obs={} "
+                  "ctx_obs={} ally_valid={} enemy_valid={}".format(
+                      tuple(agent_state.shape), tuple(ally_obs.shape),
+                      tuple(enemy_obs.shape), tuple(ctx_obs.shape),
+                      tuple(ally_valid.shape), tuple(enemy_valid.shape)))
+
+        return (agent_state, ally_obs, enemy_obs, ctx_obs,
+                ~ally_valid, ~enemy_valid, ctx_mask, ally_distance)
 
     def _split_esmg_obs(self, obs):
         """
@@ -629,9 +641,11 @@ class R_Actor(nn.Module):
 
             if use_smac_hetero:
                 # SMAC environment
-                agent_state, ally_obs, enemy_obs, ctx_obs, ally_mask, enemy_mask, ctx_mask = self._split_smac_hetero_obs(obs)
+                (agent_state, ally_obs, enemy_obs, ctx_obs, ally_mask,
+                 enemy_mask, ctx_mask, ally_distance) = self._split_smac_hetero_obs(obs)
                 graph_out = self.base(
-                    agent_state, ally_obs, enemy_obs, ctx_obs, ally_mask, enemy_mask, ctx_mask
+                    agent_state, ally_obs, enemy_obs, ctx_obs, ally_mask, enemy_mask, ctx_mask,
+                    ally_distance=ally_distance
                 )
             elif self._use_world_comm_hetero:
                 agent_state, ally_obs, enemy_obs, ctx_obs, ally_mask, enemy_mask, ctx_mask = self._split_world_comm_hetero_obs(obs)

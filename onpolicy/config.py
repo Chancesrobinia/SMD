@@ -369,5 +369,9 @@ def get_config():
                         help="Per-landmark feature dimension (relative pos). Default 2.")
     parser.add_argument("--num_neighbors", type=int, default=None,
                         help="Number of neighbor agents. If None, inferred from num_agents - 1.")
+    parser.add_argument("--hetero_self_residual", action='store_true', default=False,
+                        help="Ablation only: add a projected ego-state residual to the fused HeteroGraph feature. Off by default so it is never bundled with the parser fixes.")
+    parser.add_argument("--hetero_self_residual_scale", type=float, default=1.0,
+                        help="Initial value of the learnable scale applied to the --hetero_self_residual branch.")
 
     return parser
