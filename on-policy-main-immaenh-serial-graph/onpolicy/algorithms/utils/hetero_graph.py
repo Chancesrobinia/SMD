@@ -201,6 +201,7 @@ class ParallelAllyEntityGraphActorBase(nn.Module):
         smd_use_positive_adv_only=False,
         smd_online_sampling=False,
         smd_debug_shapes=False,
+        distance_feature_index=None,
         use_gsd_bsd=False,
         gsd_bsd_ally_candidate_k=4,
         gsd_bsd_enemy_candidate_k=4,
@@ -436,6 +437,7 @@ class EntityEnemyFirstGraphActorBase(nn.Module):
         smd_use_positive_adv_only=False,
         smd_online_sampling=False,
         smd_debug_shapes=False,
+        distance_feature_index=None,
         use_gsd_bsd=False,
         gsd_bsd_ally_candidate_k=4,
         gsd_bsd_enemy_candidate_k=4,
@@ -745,6 +747,7 @@ class HeteroGraphActorBase(nn.Module):
         smd_use_positive_adv_only=False,
         smd_online_sampling=False,
         smd_debug_shapes=False,
+        distance_feature_index=None,
         use_gsd_bsd=False,
         gsd_bsd_ally_candidate_k=4,
         gsd_bsd_enemy_candidate_k=4,
@@ -794,6 +797,7 @@ class HeteroGraphActorBase(nn.Module):
         self.gsd_bsd_debug = gsd_bsd_debug
         self.gsd_bsd_actual_enemy_base_score_source = "none"
         self.smd_candidate_top_k = smd_candidate_top_k
+        self.distance_feature_index = distance_feature_index
         self.smd_pseudo_top_m = smd_pseudo_top_m
         self.smd_use_positive_adv_only = smd_use_positive_adv_only
         self.lambda_smd_diff = lambda_smd_diff
@@ -974,6 +978,45 @@ class HeteroGraphActorBase(nn.Module):
         attn_mean = attn.squeeze(2).mean(dim=1)                               # Shape: [B, S]
         return out, attn_mean
 
+    def _st_selected_attention(self, Q, K, V, candidate_mask, hard_mask, soft_mask, head_dim):
+        """Hard selected attention in forward, soft budget attention in backward."""
+        B = Q.shape[0]
+        S = K.shape[-2]
+        if S == 0:
+            zero = Q.new_zeros(B, self.hidden_size)
+            return zero, Q.new_zeros(B, 0), Q.new_zeros(B, 0)
+
+        candidate_mask = candidate_mask.to(device=Q.device, dtype=torch.bool)
+        hard_mask = hard_mask.to(device=Q.device, dtype=Q.dtype)
+        soft_mask = soft_mask.to(device=Q.device, dtype=Q.dtype)
+        base_logits = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(float(head_dim))
+
+        def attend(weights, valid, add_log_weights=False):
+            logits = base_logits
+            valid = valid & candidate_mask
+            if add_log_weights:
+                logits = logits + torch.log(weights.clamp_min(1e-12))[:, None, None, :]
+            logits = logits.masked_fill(~valid[:, None, None, :], -1e9)
+            has_valid = valid.any(dim=-1, keepdim=True)
+            logits = logits.masked_fill(~has_valid[:, None, :, None], 0.0)
+            attn = F.softmax(logits, dim=-1)
+            attn = attn * valid[:, None, None, :].to(dtype=attn.dtype)
+            out = torch.matmul(attn, V)
+            out = out.transpose(1, 2).contiguous().view(B, self.hidden_size)
+            out = out * has_valid.to(dtype=out.dtype)
+            return out, attn.squeeze(2).mean(dim=1)
+
+        hard_out, hard_attn = attend(hard_mask > 0.0, hard_mask > 0.0)
+        soft_valid = soft_mask > 0.0
+        soft_out, soft_attn = attend(soft_mask, soft_valid, add_log_weights=True)
+        # A zero/fully saturated budget has no selector derivative by design.
+        partial = (soft_mask.sum(-1) > 0) & (soft_mask.sum(-1) < candidate_mask.sum(-1))
+        soft_path = torch.where(partial.unsqueeze(-1), soft_out, hard_out.detach())
+        output = hard_out + soft_path - soft_path.detach()
+        soft_attn_path = torch.where(partial.unsqueeze(-1), soft_attn, hard_attn.detach())
+        attn = hard_attn + soft_attn_path - soft_attn_path.detach()
+        return output, attn, hard_attn
+
     def _gsd_bsd_forward(self, agent_state, ally_obs, enemy_obs, ally_valid, enemy_valid, m_ally, m_threat, attn_threat):
         B = agent_state.shape[0]
         H = self.hidden_size
@@ -1134,6 +1177,10 @@ class HeteroGraphActorBase(nn.Module):
         """
         B = agent_state.shape[0]
         H = self.hidden_size
+        if self.use_smd:
+            # Avoid returning a previous rollout's relation tensors when a
+            # batch has no ally candidates.
+            self.last_smd_aux = {}
         ally_valid = self._mask_to_valid(ally_mask)
         enemy_valid = self._mask_to_valid(enemy_mask)
         ctx_valid = self._mask_to_valid(ctx_mask)
@@ -1186,7 +1233,10 @@ class HeteroGraphActorBase(nn.Module):
         else:
             if ally_valid is None:
                 ally_valid = agent_state.new_ones(B, N_ally, dtype=torch.bool) # Shape: [B, N_ally]
-            dist_sq = ally_obs[:, :, 0] ** 2 + ally_obs[:, :, 1] ** 2          # Shape: [B, N_ally]
+            if self.distance_feature_index is not None and ally_obs.shape[-1] > self.distance_feature_index:
+                dist_sq = ally_obs[:, :, self.distance_feature_index].abs()    # SMAC distance feature
+            else:
+                dist_sq = ally_obs[:, :, 0] ** 2 + ally_obs[:, :, 1] ** 2
             dist_sq = dist_sq.masked_fill(~ally_valid, float('inf'))           # Shape: [B, N_ally]
             candidate_k = self.smd_candidate_top_k if self.use_smd else self.k_max
             effective_k = min(candidate_k if self.use_knn else N_ally, N_ally)
@@ -1201,7 +1251,10 @@ class HeteroGraphActorBase(nn.Module):
 
             if self.use_smd:
                 rel = knn_obs[..., :2] if knn_obs.shape[-1] >= 2 else knn_obs.new_zeros(B, effective_k, 2)
-                dist = torch.norm(rel, dim=-1, keepdim=True)
+                if self.distance_feature_index is not None and knn_obs.shape[-1] > self.distance_feature_index:
+                    dist = knn_obs[..., self.distance_feature_index:self.distance_feature_index + 1].abs()
+                else:
+                    dist = torch.norm(rel, dim=-1, keepdim=True)
                 distance_feat = torch.cat([dist, rel], dim=-1)                 # Shape: [B, k_max, 3]
                 smd_out = self.student_mask_head(
                     threat_repr=m_threat,
@@ -1210,18 +1263,17 @@ class HeteroGraphActorBase(nn.Module):
                     distance_feat=distance_feat,
                 )
                 hard_mask = smd_out["hard_mask"]                               # Shape: [B, k_max]
-                masked_obs = knn_obs * hard_mask.unsqueeze(-1)                 # Shape: [B, k_max, d_ally]
-                filtered_ally = masked_obs                                     # Shape: [B, k_max, d_ally]
-                filtered_valid = (hard_mask > 0) & knn_valid                   # Shape: [B, k_max]
-                no_selected = ~filtered_valid.any(dim=-1, keepdim=True)
-                filtered_valid = torch.where(no_selected, knn_valid, filtered_valid)
-                filtered_ally = torch.where(no_selected.unsqueeze(-1), knn_obs, filtered_ally)
+                filtered_ally = knn_obs
+                filtered_valid = knn_valid
                 self.last_smd_aux = {
                     "edge_logits": smd_out["edge_logits"],
                     "edge_probs": smd_out["edge_probs"],
                     "hard_mask": smd_out["hard_mask"],
                     "candidate_mask": knn_valid.to(dtype=ally_obs.dtype),
                     "edge_context": smd_out["edge_context"],
+                    "soft_mask": smd_out["soft_mask"],
+                    "st_mask": smd_out["st_mask"],
+                    "candidate_indices": knn_idx,
                 }
             elif self.use_am_filter:
                 threat_expand = m_threat.unsqueeze(1).expand(-1, effective_k, -1)  # Shape: [B, k_max, H]
@@ -1251,9 +1303,17 @@ class HeteroGraphActorBase(nn.Module):
             V_3 = self.linear_v3(filtered_ally).view(
                 B, filtered_ally.shape[1], self.num_heads3, self.head_dim3
             ).transpose(1, 2)                                                  # Shape: [B, heads, k_filter, head_dim]
-            m_coop_raw, attn_coop = self._masked_attention_from_projected(
-                Q_3, K_3, V_3, filtered_valid, self.head_dim3
-            )                                                                  # Shape: [B, H], [B, k_filter]
+            if self.use_smd:
+                m_coop_raw, attn_coop, hard_attn_coop = self._st_selected_attention(
+                    Q_3, K_3, V_3, filtered_valid, smd_out["hard_mask"], smd_out["soft_mask"], self.head_dim3
+                )
+                self.last_smd_aux["selected_attention_mass"] = hard_attn_coop.sum(-1).detach()
+                self.last_smd_aux["selected_relation_count"] = smd_out["hard_mask"].sum(-1).detach()
+                self.last_smd_aux["mask_switch_rate"] = torch.zeros_like(self.last_smd_aux["selected_relation_count"])
+            else:
+                m_coop_raw, attn_coop = self._masked_attention_from_projected(
+                    Q_3, K_3, V_3, filtered_valid, self.head_dim3
+                )                                                                  # Shape: [B, H], [B, k_filter]
             m_coop = self.linear_out3(m_coop_raw)                              # Shape: [B, H]
 
         # Terminal gated fusion: threat intent + cooperative teammate feature.

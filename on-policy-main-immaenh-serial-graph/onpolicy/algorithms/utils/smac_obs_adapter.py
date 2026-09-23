@@ -4,7 +4,8 @@ import torch
 class SMACHeteroObservationAdapter:
     """Split classic SMAC local observations into HeteroGraph inputs."""
 
-    def __init__(self, obs_space, debug_shapes=False):
+    def __init__(self, obs_space, debug_shapes=False, include_move_context=False,
+                 preserve_move_in_state=False):
         if obs_space.__class__.__name__ != "list" or len(obs_space) < 5:
             raise ValueError(
                 "Classic SMAC HeteroGraph requires observation-space metadata "
@@ -18,6 +19,8 @@ class SMACHeteroObservationAdapter:
         self.n_enemies, self.enemy_raw_dim = self._read_entity_shape(
             obs_space[2], "enemy"
         )
+        self.ally_dim = self.ally_raw_dim
+        self.enemy_dim = self.enemy_raw_dim
         move_rows, self.move_dim = self._read_entity_shape(
             obs_space[3], "move"
         )
@@ -47,6 +50,9 @@ class SMACHeteroObservationAdapter:
             )
 
         self.agent_state_dim = self.move_dim + self.own_extra_dim
+        self.self_dim = self.own_extra_dim
+        self.include_move_context = bool(include_move_context)
+        self.preserve_move_in_state = bool(preserve_move_in_state)
         self.debug_shapes = bool(debug_shapes)
         self._debug_printed = False
 
@@ -124,17 +130,28 @@ class SMACHeteroObservationAdapter:
 
         ally_graph = self._canonicalize(ally_raw)
         enemy_graph = self._canonicalize(enemy_raw)
-        agent_state = torch.cat([move_feats, own_extra_feats], dim=-1)
+        if self.include_move_context:
+            agent_state = (
+                torch.cat([move_feats, own_extra_feats], dim=-1)
+                if self.preserve_move_in_state else own_extra_feats
+            )
+            ctx_obs = move_feats.unsqueeze(1)
+            ctx_mask = torch.zeros(
+                (batch_size, 1), dtype=torch.bool, device=obs.device
+            )
+        else:
+            # Compatibility path for callers using the original flat-state
+            # adapter.  The actor enables the explicit move context path.
+            agent_state = torch.cat([move_feats, own_extra_feats], dim=-1)
+            ctx_obs = obs.new_zeros((batch_size, 0, 1))
+            ctx_mask = torch.zeros(
+                (batch_size, 0), dtype=torch.bool, device=obs.device
+            )
 
         ally_valid = ally_raw[..., 0] > 0
         enemy_valid = enemy_raw.abs().sum(dim=-1) > 1e-6
         ally_mask = ~ally_valid
         enemy_mask = ~enemy_valid
-
-        ctx_obs = obs.new_zeros((batch_size, 0, 1))
-        ctx_mask = torch.zeros(
-            (batch_size, 0), dtype=torch.bool, device=obs.device
-        )
 
         if self.debug_shapes and not self._debug_printed:
             print("[SMAC Adapter]")

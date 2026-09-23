@@ -86,16 +86,24 @@ class R_Actor(nn.Module):
                 self.smac_adapter = SMACHeteroObservationAdapter(
                     obs_space,
                     debug_shapes=getattr(args, 'smd_debug_shapes', False),
+                    include_move_context=self._use_smd,
+                    preserve_move_in_state=self._use_smd,
                 )
                 self.smac_obs_dim = self.smac_adapter.obs_dim
                 self.smac_n_allies = self.smac_adapter.n_allies
                 self.smac_ally_raw_dim = self.smac_adapter.ally_raw_dim
+                self.smac_ally_dim = self.smac_adapter.ally_dim
                 self.smac_n_enemies = self.smac_adapter.n_enemies
                 self.smac_enemy_raw_dim = self.smac_adapter.enemy_raw_dim
+                self.smac_enemy_dim = self.smac_adapter.enemy_dim
                 self.smac_move_dim = self.smac_adapter.move_dim
                 self.smac_own_extra_dim = self.smac_adapter.own_extra_dim
-                self.agent_state_dim = self.smac_adapter.agent_state_dim
-                self.landmark_dim = 1
+                self.smac_self_dim = self.smac_adapter.self_dim
+                self.agent_state_dim = (
+                    self.smac_adapter.agent_state_dim
+                    if not self._use_smd else self.smac_adapter.agent_state_dim
+                )
+                self.landmark_dim = self.smac_adapter.move_dim if self._use_smd else 1
                 self.num_neighbors = self.smac_n_allies
                 self.neighbor_dim = self.smac_ally_raw_dim
             else:
@@ -197,7 +205,9 @@ class R_Actor(nn.Module):
                     self.smac_enemy_raw_dim
                     if self._use_smac_hetero else self.neighbor_dim
                 ),
-                ctx_dim=1 if self._use_smac_hetero else self.landmark_dim,
+                ctx_dim=(self.smac_move_dim if self._use_smac_hetero and self._use_smd
+                         else (1 if self._use_smac_hetero else self.landmark_dim)),
+                distance_feature_index=2 if self._use_smac_hetero and self._use_smd else None,
                 hidden_size=self.hidden_size,
                 use_orthogonal=self._use_orthogonal,
                 use_ReLU=getattr(args, 'use_ReLU', True),

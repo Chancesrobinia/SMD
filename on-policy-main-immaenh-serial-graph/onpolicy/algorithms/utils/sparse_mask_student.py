@@ -2,6 +2,46 @@ import torch
 import torch.nn as nn
 
 
+def straight_through_topm_mask(edge_logits, candidate_mask, edge_top_m, temperature=1.0):
+    """Return a hard Top-M forward mask with a soft budget backward path.
+
+    The soft path is only active when ``0 < M < valid_count``.  This keeps the
+    all-zero and all-valid budgets deterministic and prevents meaningless
+    selector gradients at the two boundary budgets.
+    """
+    if edge_logits.ndim != 2 or candidate_mask.shape != edge_logits.shape:
+        raise ValueError("edge_logits and candidate_mask must both be [batch, candidates]")
+    valid = candidate_mask.to(dtype=torch.bool)
+    batch_size, num_candidates = edge_logits.shape
+    hard = edge_logits.new_zeros(batch_size, num_candidates)
+    soft = edge_logits.new_zeros(batch_size, num_candidates)
+    if num_candidates == 0:
+        return hard, hard, soft
+
+    valid_count = valid.sum(dim=-1)
+    budget = valid_count.clamp(max=max(int(edge_top_m), 0))
+    if int(edge_top_m) > 0:
+        scores = edge_logits.masked_fill(~valid, torch.finfo(edge_logits.dtype).min)
+        k = min(int(edge_top_m), num_candidates)
+        _, indices = torch.topk(scores, k=k, dim=-1, largest=True)
+        hard.scatter_(dim=-1, index=indices, value=1.0)
+        hard.mul_(valid.to(dtype=hard.dtype))
+
+    partial = (budget > 0) & (budget < valid_count)
+    if partial.any():
+        scaled = edge_logits / max(float(temperature), 1e-6)
+        scaled = scaled.masked_fill(~valid, torch.finfo(edge_logits.dtype).min)
+        soft_partial = torch.softmax(scaled, dim=-1) * budget.to(edge_logits.dtype).unsqueeze(-1)
+        soft = torch.where(partial.unsqueeze(-1), soft_partial, soft)
+    # ``st`` is hard in forward and has the soft budget derivative only for
+    # partial budgets.  Boundary budgets intentionally use a detached path.
+    # Keep a zero-gradient graph at the boundary so callers can still call
+    # ``backward`` without special casing an empty selector path.
+    boundary_graph = edge_logits * 0.0
+    st = hard + soft - soft.detach() + boundary_graph * (~partial).to(edge_logits.dtype).unsqueeze(-1)
+    return st, hard, soft
+
+
 class StudentSparseMaskHead(nn.Module):
     """
     Fast online sparse communication mask predictor over spatial Top-K allies.
@@ -55,22 +95,6 @@ class StudentSparseMaskHead(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0.0)
 
-    def _hard_mask(self, edge_probs, candidate_mask):
-        if edge_probs.shape[1] == 0:
-            return edge_probs
-        valid = candidate_mask.to(dtype=torch.bool)
-        if self.use_topm_mask:
-            scores = edge_probs.masked_fill(~valid, -1.0)
-            k = min(max(int(self.edge_top_m), 1), edge_probs.shape[1])
-            _, idx = torch.topk(scores, k=k, dim=-1, largest=True)
-            hard = torch.zeros_like(edge_probs)
-            hard.scatter_(dim=-1, index=idx, value=1.0)
-            hard = hard * valid.to(dtype=hard.dtype)
-        else:
-            hard = (edge_probs > self.edge_threshold).to(dtype=edge_probs.dtype)
-            hard = hard * valid.to(dtype=hard.dtype)
-        return hard
-
     def forward(self, threat_repr, candidate_ally, candidate_mask, distance_feat=None):
         B, K = candidate_ally.shape[:2]
         if K == 0:
@@ -79,6 +103,8 @@ class StudentSparseMaskHead(nn.Module):
                 "edge_logits": empty,
                 "edge_probs": empty,
                 "hard_mask": empty,
+                "soft_mask": empty,
+                "st_mask": empty,
                 "edge_context": candidate_ally.new_zeros(B, 0, self.threat_dim * 4 + 3),
                 "student_debug": {},
             }
@@ -96,9 +122,17 @@ class StudentSparseMaskHead(nn.Module):
         )                                                               # [B, K, 4H+3]
         edge_logits = self.edge_mlp(edge_context).squeeze(-1)           # [B, K]
         valid = candidate_mask.to(dtype=torch.bool)
-        edge_logits = edge_logits.masked_fill(~valid, -1e9)
-        edge_probs = torch.sigmoid(edge_logits) * valid.to(dtype=edge_logits.dtype)
-        hard_mask = self._hard_mask(edge_probs, valid)                  # [B, K]
+        masked_logits = edge_logits.masked_fill(~valid, -1e9)
+        edge_probs = torch.sigmoid(masked_logits) * valid.to(dtype=edge_logits.dtype)
+        if self.use_topm_mask:
+            st_mask, hard_mask, soft_mask = straight_through_topm_mask(
+                masked_logits, valid, self.edge_top_m
+            )
+        else:
+            hard_mask = (edge_probs > self.edge_threshold).to(dtype=edge_probs.dtype)
+            hard_mask = hard_mask * valid.to(dtype=hard_mask.dtype)
+            soft_mask = edge_probs
+            st_mask = hard_mask + soft_mask - soft_mask.detach()
 
         if self.debug_shapes and not self._debug_printed:
             print("[SMD] threat_repr shape", tuple(threat_repr.shape))
@@ -113,6 +147,8 @@ class StudentSparseMaskHead(nn.Module):
             "edge_logits": edge_logits,
             "edge_probs": edge_probs,
             "hard_mask": hard_mask,
+            "soft_mask": soft_mask,
+            "st_mask": st_mask,
             "edge_context": edge_context,
             "student_debug": {},
         }

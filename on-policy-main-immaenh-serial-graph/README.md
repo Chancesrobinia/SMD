@@ -109,9 +109,37 @@ cd onpolicy/scripts
 chmod +x ./train_mpe.sh
 ./train_mpe.sh
 ```
-Local results are stored in subfold scripts/results. Note that we use Weights & Bias as the default visualization platform; to use Weights & Bias, please register and login to the platform first. More instructions for using Weights&Bias can be found in the official [documentation](https://docs.wandb.ai/). Adding the `--use_wandb` in command line or in the .sh file will use Tensorboard instead of Weights & Biases. 
+Local results are stored in subfold scripts/results. Note that we use Weights & Bias as the default visualization platform; to use Weights & Bias, please register and login to the platform first. More instructions for using Weights&Bias can be found in the official [documentation](https://docs.wandb.ai/). Adding the `--use_wandb` in command line or in the .sh file will use Tensorboard instead of Weights & Biases.
 
-We additionally provide `./eval_hanabi_forward.sh` for evaluating the hanabi score over 100k trials. 
+### Classic SMAC SMD
+
+SMD launchers are available for all standard classic SMAC maps in
+`onpolicy/scripts/train_smac_scripts`. For example:
+
+```bash
+cd onpolicy/scripts/train_smac_scripts
+./train_smac_8m_SMD.sh
+./train_smac_MMM2_SMD.sh
+```
+
+The generic launcher also accepts any map registered by
+`onpolicy/envs/starcraft2/smac_maps.py`:
+
+```bash
+./train_smac_SMD.sh 3s5z
+MAP_NAME=8m USE_WANDB=0 NUM_ENV_STEPS=500000 ./train_smac_SMD.sh
+```
+
+Common overrides include `SEED`, `CUDA_VISIBLE_DEVICES`, `ROLLOUT_THREADS`,
+`NUM_ENV_STEPS`, `PPO_EPOCH`, `USE_EVAL`, `USE_WANDB`, and the
+`SMD_*`/`LAMBDA_SMD_*` variables. Extra arguments are forwarded to
+`train_smac.py`. Set `DRY_RUN=1` to inspect the generated command without
+starting StarCraft II. SMD launchers use local TensorBoard logging by default;
+set `USE_WANDB=1` to enable Weights & Biases. SMD scripts intentionally
+disable stacked frames because the classic-SMAC entity adapter currently
+supports one frame.
+
+We additionally provide `./eval_hanabi_forward.sh` for evaluating the hanabi score over 100k trials.
 
 ## 4. Publication
 

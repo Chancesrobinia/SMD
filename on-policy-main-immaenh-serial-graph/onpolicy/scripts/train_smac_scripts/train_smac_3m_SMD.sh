@@ -1,5 +1,4 @@
 #!/bin/sh
-
 set -eu
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
@@ -24,7 +23,7 @@ seed="${SEED:-1}"
     --n_rollout_threads "${ROLLOUT_THREADS:-8}" \
     --num_mini_batch 1 \
     --episode_length 400 \
-    --num_env_steps "${NUM_ENV_STEPS:-500000}" \
+    --num_env_steps "${NUM_ENV_STEPS:-10000000}" \
     --ppo_epoch 5 \
     --use_eval \
     --eval_episodes 32 \

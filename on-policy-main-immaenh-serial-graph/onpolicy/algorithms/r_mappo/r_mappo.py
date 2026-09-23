@@ -98,6 +98,13 @@ class R_MAPPO():
                 'smd_edge_prob_max': 0.0,
                 'smd_hard_edge_ratio': 0.0,
                 'smd_pseudo_positive_ratio': 0.0,
+                'actor_grad_norm_preclip': 0.0,
+                'actor_grad_norm_postclip': 0.0,
+                'synergy_grad_norm': 0.0,
+                'student_grad_norm': 0.0,
+                'selected_relation_count': 0.0,
+                'mask_switch_rate': 0.0,
+                'selected_attention_mass': 0.0,
             }
         edge_logits = smd_aux['edge_logits']
         edge_probs = smd_aux['edge_probs']
@@ -146,6 +153,11 @@ class R_MAPPO():
             'smd_edge_prob_max': edge_prob_valid.max().detach().item(),
             'smd_hard_edge_ratio': hard_ratio.item(),
             'smd_pseudo_positive_ratio': pseudo_ratio.item(),
+            'selected_relation_count': hard_mask.sum(dim=-1).float().mean().detach().item(),
+            'mask_switch_rate': float(smd_aux.get('mask_switch_rate', edge_logits.new_tensor(0.0)).float().mean().detach().item())
+                if torch.is_tensor(smd_aux.get('mask_switch_rate')) else float(smd_aux.get('mask_switch_rate', 0.0)),
+            'selected_attention_mass': float(smd_aux.get('selected_attention_mass', edge_logits.new_tensor(0.0)).float().mean().detach().item())
+                if torch.is_tensor(smd_aux.get('selected_attention_mass')) else float(smd_aux.get('selected_attention_mass', 0.0)),
         }
         return smd_loss, info
 
@@ -460,10 +472,27 @@ class R_MAPPO():
             print("teacher_grad_norm    ", teacher_grad_norm)
             self._smd_grad_debug_printed = True
 
+        actor_grad_norm_preclip = get_gard_norm(self.policy.actor.parameters())
         if self._use_max_grad_norm:
             actor_grad_norm = nn.utils.clip_grad_norm_(self.policy.actor.parameters(), self.max_grad_norm)
+            actor_grad_norm_postclip = get_gard_norm(self.policy.actor.parameters())
         else:
-            actor_grad_norm = get_gard_norm(self.policy.actor.parameters())
+            actor_grad_norm = actor_grad_norm_preclip
+            actor_grad_norm_postclip = actor_grad_norm_preclip
+
+        base = getattr(self.policy.actor, 'base', None)
+        def _module_grad_norm(module):
+            if module is None:
+                return 0.0
+            total = 0.0
+            for param in module.parameters():
+                if param.grad is not None:
+                    total += float(param.grad.detach().norm().item() ** 2)
+            return total ** 0.5
+        smd_info['actor_grad_norm_preclip'] = float(actor_grad_norm_preclip)
+        smd_info['actor_grad_norm_postclip'] = float(actor_grad_norm_postclip)
+        smd_info['student_grad_norm'] = _module_grad_norm(getattr(base, 'student_mask_head', None))
+        smd_info['synergy_grad_norm'] = _module_grad_norm(getattr(base, 'synergy_mlp', None))
 
         self.policy.actor_optimizer.step()
 
@@ -521,6 +550,13 @@ class R_MAPPO():
         train_info['smd_edge_prob_max'] = 0
         train_info['smd_hard_edge_ratio'] = 0
         train_info['smd_pseudo_positive_ratio'] = 0
+        train_info['actor_grad_norm_preclip'] = 0
+        train_info['actor_grad_norm_postclip'] = 0
+        train_info['synergy_grad_norm'] = 0
+        train_info['student_grad_norm'] = 0
+        train_info['selected_relation_count'] = 0
+        train_info['mask_switch_rate'] = 0
+        train_info['selected_attention_mass'] = 0
         train_info['gsd_bsd/ally_diffusion_loss'] = 0
         train_info['gsd_bsd/enemy_diffusion_loss'] = 0
         train_info['gsd_bsd/total_diffusion_loss'] = 0
@@ -576,6 +612,13 @@ class R_MAPPO():
                     'smd_edge_prob_max',
                     'smd_hard_edge_ratio',
                     'smd_pseudo_positive_ratio',
+                    'actor_grad_norm_preclip',
+                    'actor_grad_norm_postclip',
+                    'synergy_grad_norm',
+                    'student_grad_norm',
+                    'selected_relation_count',
+                    'mask_switch_rate',
+                    'selected_attention_mass',
                     'gsd_bsd/ally_diffusion_loss',
                     'gsd_bsd/enemy_diffusion_loss',
                     'gsd_bsd/total_diffusion_loss',

@@ -72,23 +72,35 @@ class SparseMaskDiffusionTeacher(nn.Module):
                 "teacher_logits": edge_context.new_zeros(B, 0),
                 "teacher_probs": edge_context.new_zeros(B, 0),
                 "teacher_mask": edge_context.new_zeros(B, 0),
+                "timesteps": torch.zeros(B, dtype=torch.long, device=edge_context.device),
+                "x0": edge_context.new_zeros(B, 0),
+                "x0_pred": edge_context.new_zeros(B, 0),
                 "smd_debug": {},
             }
 
         valid = candidate_mask.to(dtype=torch.bool)
         target = 2.0 * pseudo_mask.to(dtype=edge_context.dtype) - 1.0          # [B, K]
         noise = torch.randn_like(target)
-        t = torch.randint(0, self.num_diffusion_steps, target.shape, device=target.device)
+        # One diffusion timestep is sampled for each training sample, then
+        # broadcast across that sample's candidate edges.
+        t = torch.randint(0, self.num_diffusion_steps, (B,), device=target.device)
         schedule = MaskDiffusionSchedule(self.num_diffusion_steps, self.beta_start, self.beta_end, target.device)
-        x_t = schedule.add_noise(target, t, noise)                             # [B, K]
+        t_edges = t.unsqueeze(-1).expand(-1, K)
+        x_t = schedule.add_noise(target, t_edges, noise)                       # [B, K]
         t_emb = self.time_emb(t.long().clamp(max=self.time_emb.num_embeddings - 1))
+        t_emb = t_emb.unsqueeze(1).expand(-1, K, -1)
         denoise_in = torch.cat([x_t.unsqueeze(-1), edge_context, t_emb], dim=-1)
         pred_noise = self.denoiser(denoise_in).squeeze(-1)                    # [B, K]
+
+        alpha_bar = schedule.alpha_bars.to(target.device)[t].to(dtype=target.dtype)
+        sqrt_alpha_bar = torch.sqrt(alpha_bar).unsqueeze(-1)
+        sqrt_one_minus = torch.sqrt(1.0 - alpha_bar).unsqueeze(-1)
+        x0_pred = (x_t - sqrt_one_minus * pred_noise) / sqrt_alpha_bar.clamp_min(1e-6)
 
         loss = F.mse_loss(pred_noise, noise, reduction="none") * valid.to(dtype=target.dtype)
         mask_diffusion_loss = loss.sum() / valid.to(dtype=target.dtype).sum().clamp_min(1.0)
 
-        teacher_logits = -pred_noise.detach()
+        teacher_logits = x0_pred.detach()
         teacher_probs = torch.sigmoid(teacher_logits) * valid.to(dtype=target.dtype)
         teacher_mask = (teacher_probs > 0.5).to(dtype=target.dtype) * valid.to(dtype=target.dtype)
 
@@ -102,5 +114,8 @@ class SparseMaskDiffusionTeacher(nn.Module):
             "teacher_logits": teacher_logits,
             "teacher_probs": teacher_probs,
             "teacher_mask": teacher_mask,
+            "timesteps": t,
+            "x0": target,
+            "x0_pred": x0_pred,
             "smd_debug": {},
         }
