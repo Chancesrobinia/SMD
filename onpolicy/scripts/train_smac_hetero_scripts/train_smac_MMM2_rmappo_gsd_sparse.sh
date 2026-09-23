@@ -16,7 +16,7 @@ for seed in `seq ${seed_max}`;
 do
     echo "seed is ${seed}:"
     CUDA_VISIBLE_DEVICES=0 python "$TRAIN" --env_name ${env} --algorithm_name ${algo} --experiment_name ${exp} \
-    --map_name ${map} --seed ${seed} \
+    --map_name ${map} --seed ${seed} --use_wandb \
     --n_training_threads 1 --n_rollout_threads 8 \
     --num_mini_batch 1 --episode_length 180 \
     --num_env_steps 10000000 --ppo_epoch 15 --clip_param 0.05 \

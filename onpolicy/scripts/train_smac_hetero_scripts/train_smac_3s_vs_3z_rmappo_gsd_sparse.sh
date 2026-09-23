@@ -17,7 +17,7 @@ do
     echo "seed is ${seed}:"
     CUDA_VISIBLE_DEVICES=0 python "$TRAIN" --env_name ${env} --algorithm_name ${algo} --experiment_name ${exp} \
     --map_name ${map} --seed ${seed} \
-    --n_training_threads 1 --n_rollout_threads 8 \
+    --n_training_threads 1 --n_rollout_threads 8 --use_wandb False\
     --num_mini_batch 1 --episode_length 150 \
     --num_env_steps 10000000 --ppo_epoch 15 --clip_param 0.05 \
     --lr 5e-4 --critic_lr 5e-4 --entropy_coef 0.01 --gain 0.01 \
