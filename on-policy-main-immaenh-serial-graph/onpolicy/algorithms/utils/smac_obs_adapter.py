@@ -49,10 +49,16 @@ class SMACHeteroObservationAdapter:
                 .format(metadata_dim, self.obs_dim)
             )
 
-        self.agent_state_dim = self.move_dim + self.own_extra_dim
-        self.self_dim = self.own_extra_dim
         self.include_move_context = bool(include_move_context)
         self.preserve_move_in_state = bool(preserve_move_in_state)
+        self.agent_state_dim = (
+            self.move_dim + self.own_extra_dim
+            if self.preserve_move_in_state or not self.include_move_context
+            else self.own_extra_dim
+        )
+        self.self_dim = self.own_extra_dim
+        # Entity features are canonicalized as [dx, dy, distance, flag, ...].
+        self.ally_distance_index = 2
         self.debug_shapes = bool(debug_shapes)
         self._debug_printed = False
 

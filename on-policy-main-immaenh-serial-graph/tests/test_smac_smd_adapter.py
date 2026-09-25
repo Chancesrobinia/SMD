@@ -8,7 +8,7 @@ from gym.spaces import Box, Discrete
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 
 from onpolicy.algorithms.r_mappo.algorithm.rMAPPOPolicy import R_MAPPOPolicy
-from onpolicy.algorithms.r_mappo.algorithm.r_actor_critic import R_Actor
+from onpolicy.algorithms.r_mappo.algorithm.r_actor_critic import R_Actor, GraphRawObservationFusion
 from onpolicy.algorithms.r_mappo.r_mappo import R_MAPPO
 from onpolicy.algorithms.utils.smac_obs_adapter import SMACHeteroObservationAdapter
 from onpolicy.config import get_config
@@ -266,7 +266,7 @@ def test_actor_uses_metadata_dimensions_and_preserves_available_actions():
     assert actor.smac_enemy_raw_dim == 5
     assert actor.smac_move_dim == 4
     assert actor.smac_own_extra_dim == 17
-    assert actor.agent_state_dim == 21
+    assert actor.agent_state_dim == 17
     assert actor.base.ally_dim == 14
     assert actor.base.enemy_dim == 5
     assert torch.equal(actions, torch.full_like(actions, 7))
@@ -278,6 +278,110 @@ def test_stacked_frames_are_rejected_for_smac_heterograph():
 
     with pytest.raises(NotImplementedError, match="stacked_frames"):
         make_actor(metadata, use_stacked_frames=True, stacked_frames=2)
+
+
+@pytest.mark.parametrize("map_name", ["3m", "1c3s5z", "MMM2"])
+def test_real_smac_map_metadata_runs_through_smd_actor(map_name):
+    from onpolicy.envs.starcraft2.StarCraft2_Env import StarCraft2Env
+    from onpolicy.scripts.train.train_smac import parse_args
+
+    env_args = parse_args(["--map_name", map_name], get_config())
+    env = StarCraft2Env(env_args)
+    metadata = env.get_obs_size()
+    actor = make_actor(metadata, map_name=map_name,
+                       num_agents=env.n_agents, num_enemies=env.n_enemies,
+                       use_graph_raw_obs_fusion=True)
+    obs = make_flat_obs(metadata, batch_size=2)
+    features, _ = actor._extract_features(obs)
+    assert features.shape == (2, actor.hidden_size)
+    assert torch.isfinite(features).all()
+    assert actor.smac_ally_dim == metadata[1][1]
+    assert actor.smac_enemy_dim == metadata[2][1]
+    assert actor.raw_obs_fusion is not None
+    assert 0.0 < float(actor.last_raw_obs_gate_mean) < 1.0
+
+
+def test_raw_observation_fusion_changes_actor_feature_without_changing_shape():
+    torch.manual_seed(3)
+    fusion = GraphRawObservationFusion(obs_dim=11, hidden_size=16)
+    graph = torch.randn(4, 16)
+    raw_a = torch.zeros(4, 11)
+    raw_b = torch.ones(4, 11)
+    out_a = fusion(graph, raw_a)
+    out_b = fusion(graph, raw_b)
+    assert out_a.shape == graph.shape
+    assert not torch.allclose(out_a, out_b)
+
+
+def test_ppo_only_gradient_reaches_student_and_policy_path():
+    torch.manual_seed(7)
+    metadata = make_metadata()
+    actor = make_actor(metadata, use_recurrent_policy=True,
+                       use_smd_diffusion_teacher=False,
+                       use_graph_raw_obs_fusion=True)
+    obs = make_flat_obs(metadata, batch_size=6)
+    ally, enemy, move, own = entity_views(obs, metadata)
+    ally[:, 0, :4] = torch.tensor([1.0, 0.4, 0.2, -0.1])
+    ally[:, 1, :4] = torch.tensor([1.0, 0.8, -0.3, 0.2])
+    enemy[:, 0, :4] = torch.tensor([1.0, 0.3, 0.1, 0.2])
+    move[:] = torch.randn_like(move)
+    own[:] = torch.randn_like(own)
+    actions = torch.zeros(6, 1)
+    states = torch.zeros(6, 1, actor.hidden_size)
+    masks = torch.ones(6, 1)
+    with torch.no_grad():
+        actor(obs, states, masks, deterministic=True)
+        rollout_aux = {key: actor.base.last_smd_aux[key].clone()
+                       for key in ("candidate_indices", "candidate_mask", "hard_mask")}
+    log_probs, _, _ = actor.evaluate_actions_with_smd(obs, states, actions, masks)
+    for key, expected in rollout_aux.items():
+        assert torch.equal(actor.base.last_smd_aux[key], expected), key
+    ratio = torch.exp(log_probs - (log_probs.detach() + 0.1))
+    advantage = torch.ones_like(ratio)
+    loss = -torch.min(ratio * advantage,
+                      ratio.clamp(0.8, 1.2) * advantage).mean()
+    actor.zero_grad()
+    loss.backward()
+
+    for module in (actor.base.student_mask_head.edge_mlp,
+                   actor.base.linear_q3, actor.base.linear_k3,
+                   actor.base.linear_v3, actor.base.linear_q2,
+                   actor.raw_obs_fusion, actor.rnn, actor.act):
+        norm = sum(float(p.grad.detach().norm()) for p in module.parameters()
+                   if p.grad is not None)
+        assert norm > 0.0, type(module).__name__
+
+
+def test_smd_full_ppo_update_is_finite():
+    metadata = make_metadata()
+    args = make_args(use_smd_diffusion_teacher=True,
+                     use_graph_raw_obs_fusion=True)
+    policy = R_MAPPOPolicy(
+        args, metadata,
+        Box(low=-np.inf, high=np.inf, shape=(81,), dtype=np.float32),
+        Discrete(9), torch.device("cpu"),
+    )
+    trainer = R_MAPPO(args, policy, torch.device("cpu"))
+    obs = make_flat_obs(metadata, batch_size=6)
+    ally, enemy, move, own = entity_views(obs, metadata)
+    ally[:, 0, :4] = torch.tensor([1.0, 0.4, 0.2, -0.1])
+    ally[:, 1, :4] = torch.tensor([1.0, 0.8, -0.3, 0.2])
+    enemy[:, 0, :4] = torch.tensor([1.0, 0.3, 0.1, 0.2])
+    move[:] = 0.5
+    own[:] = 0.5
+    sample = (
+        torch.zeros(6, 81), obs, torch.zeros(6, 1, 64),
+        torch.zeros(6, 1, 64), torch.zeros(6, 1),
+        torch.zeros(6, 1), torch.ones(6, 1), torch.ones(6, 1),
+        torch.ones(6, 1), torch.zeros(6, 1), torch.ones(6, 1),
+        torch.ones(6, 9),
+    )
+    result = trainer.ppo_update(sample)
+    assert all(torch.isfinite(x).all() for x in result[:6] if torch.is_tensor(x))
+    assert np.isfinite(result[-1]['student_grad_norm'])
+    assert result[-1]['student_grad_norm'] > 0.0
+    assert result[-1]['raw_obs_fusion_grad_norm'] > 0.0
+    assert 0.0 < result[-1]['raw_obs_gate_mean'] < 1.0
 
 
 def test_classic_smac_visibility_matrix_uses_supported_bool_dtype():

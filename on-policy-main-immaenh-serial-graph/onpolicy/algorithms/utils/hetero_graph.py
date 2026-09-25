@@ -978,7 +978,7 @@ class HeteroGraphActorBase(nn.Module):
         attn_mean = attn.squeeze(2).mean(dim=1)                               # Shape: [B, S]
         return out, attn_mean
 
-    def _st_selected_attention(self, Q, K, V, candidate_mask, hard_mask, soft_mask, head_dim):
+    def _st_selected_attention(self, Q, K, V, candidate_mask, hard_mask, edge_logits, head_dim):
         """Hard selected attention in forward, soft budget attention in backward."""
         B = Q.shape[0]
         S = K.shape[-2]
@@ -988,34 +988,31 @@ class HeteroGraphActorBase(nn.Module):
 
         candidate_mask = candidate_mask.to(device=Q.device, dtype=torch.bool)
         hard_mask = hard_mask.to(device=Q.device, dtype=Q.dtype)
-        soft_mask = soft_mask.to(device=Q.device, dtype=Q.dtype)
         base_logits = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(float(head_dim))
 
-        def attend(weights, valid, add_log_weights=False):
-            logits = base_logits
+        def attend(valid, score_bias=None):
+            logits = base_logits if score_bias is None else base_logits + score_bias[:, None, None, :]
             valid = valid & candidate_mask
-            if add_log_weights:
-                logits = logits + torch.log(weights.clamp_min(1e-12))[:, None, None, :]
             logits = logits.masked_fill(~valid[:, None, None, :], -1e9)
             has_valid = valid.any(dim=-1, keepdim=True)
             logits = logits.masked_fill(~has_valid[:, None, :, None], 0.0)
             attn = F.softmax(logits, dim=-1)
             attn = attn * valid[:, None, None, :].to(dtype=attn.dtype)
-            out = torch.matmul(attn, V)
-            out = out.transpose(1, 2).contiguous().view(B, self.hidden_size)
-            out = out * has_valid.to(dtype=out.dtype)
-            return out, attn.squeeze(2).mean(dim=1)
+            return attn
 
-        hard_out, hard_attn = attend(hard_mask > 0.0, hard_mask > 0.0)
-        soft_valid = soft_mask > 0.0
-        soft_out, soft_attn = attend(soft_mask, soft_valid, add_log_weights=True)
-        # A zero/fully saturated budget has no selector derivative by design.
-        partial = (soft_mask.sum(-1) > 0) & (soft_mask.sum(-1) < candidate_mask.sum(-1))
-        soft_path = torch.where(partial.unsqueeze(-1), soft_out, hard_out.detach())
-        output = hard_out + soft_path - soft_path.detach()
-        soft_attn_path = torch.where(partial.unsqueeze(-1), soft_attn, hard_attn.detach())
-        attn = hard_attn + soft_attn_path - soft_attn_path.detach()
-        return output, attn, hard_attn
+        hard_attn = attend(hard_mask > 0.0)
+        # For Top-M, log(M * softmax(edge_logits)) differs from edge_logits
+        # only by a row-wise constant. Use logits directly to avoid log(1e-12).
+        soft_attn = attend(candidate_mask, edge_logits)
+        selected = hard_mask.sum(-1)
+        partial = (selected > 0) & (selected < candidate_mask.sum(-1))
+        attn = torch.where(
+            partial[:, None, None, None],
+            hard_attn.detach() - soft_attn.detach() + soft_attn,
+            hard_attn,
+        )
+        output = torch.matmul(attn, V).transpose(1, 2).contiguous().view(B, self.hidden_size)
+        return output, attn.squeeze(2).mean(dim=1), hard_attn.squeeze(2).mean(dim=1)
 
     def _gsd_bsd_forward(self, agent_state, ally_obs, enemy_obs, ally_valid, enemy_valid, m_ally, m_threat, attn_threat):
         B = agent_state.shape[0]
@@ -1304,8 +1301,14 @@ class HeteroGraphActorBase(nn.Module):
                 B, filtered_ally.shape[1], self.num_heads3, self.head_dim3
             ).transpose(1, 2)                                                  # Shape: [B, heads, k_filter, head_dim]
             if self.use_smd:
+                # This policy attention score is independent of the Student
+                # selector and supplies a per-edge auxiliary target.
+                self.last_smd_aux["candidate_scores"] = (
+                    torch.matmul(Q_3, K_3.transpose(-2, -1))
+                    .squeeze(1).squeeze(1) / math.sqrt(float(self.head_dim3))
+                ).detach()
                 m_coop_raw, attn_coop, hard_attn_coop = self._st_selected_attention(
-                    Q_3, K_3, V_3, filtered_valid, smd_out["hard_mask"], smd_out["soft_mask"], self.head_dim3
+                    Q_3, K_3, V_3, filtered_valid, smd_out["hard_mask"], smd_out["edge_logits"], self.head_dim3
                 )
                 self.last_smd_aux["selected_attention_mass"] = hard_attn_coop.sum(-1).detach()
                 self.last_smd_aux["selected_relation_count"] = smd_out["hard_mask"].sum(-1).detach()

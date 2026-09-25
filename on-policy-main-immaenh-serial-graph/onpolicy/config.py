@@ -357,6 +357,8 @@ def get_config():
                         help="Use Heterogeneous Dual-Graph (L2A + A2A) Actor instead of ESMG / MLP.")
     parser.add_argument("--use_gated_fusion", action='store_true', default=False,
                         help="Use feature-level gated concatenation in HeteroGraph terminal fusion.")
+    parser.add_argument("--use_graph_raw_obs_fusion", action='store_true', default=False,
+                        help="Fuse the local flat SMAC observation with the three-hop graph feature before the actor RNN.")
     parser.add_argument("--use_parallel_ally_graph", action='store_true', default=False,
                         help="Use parallel AllyGraph + AllEntityGraph actor base under --use_hetero_graph.")
     parser.add_argument("--use_entity_enemy_first_graph", action='store_true', default=False,

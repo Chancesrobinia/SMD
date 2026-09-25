@@ -49,6 +49,7 @@ class R_MAPPO():
         self._use_smd = getattr(args, 'use_smd', False)
         self._smd_debug_shapes = getattr(args, 'smd_debug_shapes', False)
         self._smd_grad_debug_printed = False
+        self._smd_ppo_grad_checked = False
         self._use_gsd_bsd = getattr(args, 'use_gsd_bsd', False)
         self.lambda_gsd_bsd_diff = getattr(args, 'lambda_gsd_bsd_diff', 0.01)
         self.lambda_gsd_bsd_noop = getattr(args, 'lambda_gsd_bsd_noop', 1.0)
@@ -63,25 +64,27 @@ class R_MAPPO():
         else:
             self.value_normalizer = None
 
-    def _build_smd_pseudo_mask(self, edge_probs, candidate_mask, adv_targ, pseudo_top_m, positive_only=False):
+    def _build_smd_pseudo_mask(self, candidate_scores, candidate_mask, adv_targ, pseudo_top_m, positive_only=False):
         valid = candidate_mask.to(dtype=torch.bool)
-        if edge_probs.shape[1] == 0:
-            return edge_probs.new_zeros(edge_probs.shape)
+        if candidate_scores.shape[1] == 0:
+            return candidate_scores.new_zeros(candidate_scores.shape)
         adv = adv_targ.detach()
         while adv.dim() > 1:
             adv = adv.squeeze(-1)
-        adv_weight = torch.abs(adv).view(-1, 1).to(dtype=edge_probs.dtype)
-        utility = edge_probs.detach() * adv_weight
-        if positive_only:
-            utility = utility * (adv.view(-1, 1) > 0).to(dtype=edge_probs.dtype)
-        utility = utility.masked_fill(~valid, -1.0)
-        k = min(max(int(pseudo_top_m), 1), edge_probs.shape[1])
+        # Policy attention scores vary across edges. Reverse the ranking for
+        # negative-advantage samples rather than multiplying the Student's own
+        # probabilities by a row-constant |advantage|.
+        utility = candidate_scores.detach() * adv.sign().view(-1, 1)
+        utility = utility.masked_fill(~valid, torch.finfo(candidate_scores.dtype).min)
+        k = min(max(int(pseudo_top_m), 0), candidate_scores.shape[1])
+        if k == 0:
+            return candidate_scores.new_zeros(candidate_scores.shape)
         _, idx = torch.topk(utility, k=k, dim=-1, largest=True)
-        pseudo = torch.zeros_like(edge_probs)
+        pseudo = torch.zeros_like(candidate_scores)
         pseudo.scatter_(dim=-1, index=idx, value=1.0)
         pseudo = pseudo * valid.to(dtype=pseudo.dtype)
-        if positive_only:
-            pseudo = pseudo * (adv.view(-1, 1) > 0).to(dtype=pseudo.dtype)
+        eligible = adv > 0 if positive_only else adv != 0
+        pseudo = pseudo * eligible.view(-1, 1).to(dtype=pseudo.dtype)
         return pseudo.detach()
 
     def compute_smd_aux_loss(self, smd_aux, adv_targ):
@@ -114,24 +117,33 @@ class R_MAPPO():
         base = getattr(self.policy.actor, 'base', None)
 
         pseudo_mask = self._build_smd_pseudo_mask(
-            edge_probs, candidate_mask, adv_targ,
+            smd_aux['candidate_scores'], candidate_mask, adv_targ,
             getattr(base, 'smd_pseudo_top_m', 1),
             getattr(base, 'smd_use_positive_adv_only', False),
         )
         valid = candidate_mask.to(dtype=torch.bool)
-        bce = nn.functional.binary_cross_entropy_with_logits(edge_logits, pseudo_mask, reduction='none')
-        mask_distill_loss = (bce * candidate_mask).sum() / candidate_mask.sum().clamp_min(1.0)
+        adv = adv_targ.detach().reshape(-1)
+        eligible = adv > 0 if getattr(base, 'smd_use_positive_adv_only', False) else adv != 0
+        supervised = candidate_mask * eligible.to(dtype=edge_logits.dtype).unsqueeze(-1)
 
         if getattr(base, 'smd_teacher', None) is not None:
-            teacher_out = base.smd_teacher(edge_context, pseudo_mask, candidate_mask)
+            teacher_out = base.smd_teacher(edge_context.detach(), pseudo_mask, supervised)
             mask_diffusion_loss = teacher_out['mask_diffusion_loss']
+            student_target = 0.5 * pseudo_mask + 0.5 * teacher_out['teacher_probs'].detach()
         else:
             mask_diffusion_loss = edge_logits.new_tensor(0.0)
+            student_target = pseudo_mask
+
+        bce = nn.functional.binary_cross_entropy_with_logits(edge_logits, student_target, reduction='none')
+        mask_distill_loss = (bce * supervised).sum() / supervised.sum().clamp_min(1.0)
 
         degree = (hard_mask * candidate_mask).sum(dim=-1)
         valid_agent = valid.any(dim=-1).to(dtype=edge_logits.dtype)
         avg_degree = (degree * valid_agent).sum() / valid_agent.sum().clamp_min(1.0)
-        sparse_loss = torch.relu(avg_degree - getattr(base, 'smd_target_degree', 1.0))
+        expected_degree = (edge_probs * candidate_mask).sum(dim=-1)
+        sparse_loss = (
+            torch.relu(expected_degree - getattr(base, 'smd_target_degree', 1.0)) * valid_agent
+        ).sum() / valid_agent.sum().clamp_min(1.0)
 
         smd_loss = (
             getattr(base, 'lambda_smd_diff', 0.01) * mask_diffusion_loss
@@ -429,7 +441,7 @@ class R_MAPPO():
                                                                               active_masks_batch)
             recon_loss = torch.tensor(0.0)
         # actor update
-        imp_weights = torch.exp(action_log_probs - old_action_log_probs_batch)
+        imp_weights = torch.exp((action_log_probs - old_action_log_probs_batch).clamp(-10.0, 10.0))
 
         surr1 = imp_weights * adv_targ
         surr2 = torch.clamp(imp_weights, 1.0 - self.clip_param, 1.0 + self.clip_param) * adv_targ
@@ -437,7 +449,7 @@ class R_MAPPO():
         if self._use_policy_active_masks:
             policy_action_loss = (-torch.sum(torch.min(surr1, surr2),
                                              dim=-1,
-                                             keepdim=True) * active_masks_batch).sum() / active_masks_batch.sum()
+                                             keepdim=True) * active_masks_batch).sum() / active_masks_batch.sum().clamp_min(1.0)
         else:
             policy_action_loss = -torch.sum(torch.min(surr1, surr2), dim=-1, keepdim=True).mean()
 
@@ -446,6 +458,31 @@ class R_MAPPO():
         self.policy.actor_optimizer.zero_grad()
 
         if update_actor:
+            if self._use_smd and self._smd_debug_shapes and not self._smd_ppo_grad_checked:
+                actor = self.policy.actor
+                base = actor.base
+                groups = {
+                    'student_mlp': base.student_mask_head.edge_mlp,
+                    'hop3_q': base.linear_q3,
+                    'hop3_k': base.linear_k3,
+                    'hop3_v': base.linear_v3,
+                    'hop2': base.linear_q2,
+                    'rnn': getattr(actor, 'rnn', None),
+                    'action_head': actor.act,
+                }
+                for name, module in groups.items():
+                    if module is None:
+                        continue
+                    params = [p for p in module.parameters() if p.requires_grad]
+                    if not params:
+                        continue
+                    grads = torch.autograd.grad(
+                        policy_loss, params, retain_graph=True, allow_unused=True
+                    )
+                    norm = sum(float(g.detach().norm().item() ** 2)
+                               for g in grads if g is not None) ** 0.5
+                    print('[SMD PPO-only gradient] {} = {:.6g}'.format(name, norm))
+                self._smd_ppo_grad_checked = True
             total_actor_loss = policy_loss - dist_entropy * self.entropy_coef + recon_loss * self.recon_loss_coef + smd_loss + gsd_bsd_loss
             total_actor_loss.backward()
 
@@ -493,6 +530,10 @@ class R_MAPPO():
         smd_info['actor_grad_norm_postclip'] = float(actor_grad_norm_postclip)
         smd_info['student_grad_norm'] = _module_grad_norm(getattr(base, 'student_mask_head', None))
         smd_info['synergy_grad_norm'] = _module_grad_norm(getattr(base, 'synergy_mlp', None))
+        raw_fusion = getattr(self.policy.actor, 'raw_obs_fusion', None)
+        smd_info['raw_obs_fusion_grad_norm'] = _module_grad_norm(raw_fusion)
+        gate_mean = getattr(self.policy.actor, 'last_raw_obs_gate_mean', None)
+        smd_info['raw_obs_gate_mean'] = float(gate_mean) if gate_mean is not None else 0.0
 
         self.policy.actor_optimizer.step()
 
@@ -527,8 +568,11 @@ class R_MAPPO():
             advantages = buffer.returns[:-1] - buffer.value_preds[:-1]
         advantages_copy = advantages.copy()
         advantages_copy[buffer.active_masks[:-1] == 0.0] = np.nan
-        mean_advantages = np.nanmean(advantages_copy)
-        std_advantages = np.nanstd(advantages_copy)
+        if np.isnan(advantages_copy).all():
+            mean_advantages, std_advantages = 0.0, 1.0
+        else:
+            mean_advantages = np.nanmean(advantages_copy)
+            std_advantages = np.nanstd(advantages_copy)
         advantages = (advantages - mean_advantages) / (std_advantages + 1e-5)
         
 
@@ -554,6 +598,8 @@ class R_MAPPO():
         train_info['actor_grad_norm_postclip'] = 0
         train_info['synergy_grad_norm'] = 0
         train_info['student_grad_norm'] = 0
+        train_info['raw_obs_fusion_grad_norm'] = 0
+        train_info['raw_obs_gate_mean'] = 0
         train_info['selected_relation_count'] = 0
         train_info['mask_switch_rate'] = 0
         train_info['selected_attention_mass'] = 0
@@ -616,6 +662,8 @@ class R_MAPPO():
                     'actor_grad_norm_postclip',
                     'synergy_grad_norm',
                     'student_grad_norm',
+                    'raw_obs_fusion_grad_norm',
+                    'raw_obs_gate_mean',
                     'selected_relation_count',
                     'mask_switch_rate',
                     'selected_attention_mass',

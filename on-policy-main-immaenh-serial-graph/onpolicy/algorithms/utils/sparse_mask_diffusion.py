@@ -101,7 +101,7 @@ class SparseMaskDiffusionTeacher(nn.Module):
         mask_diffusion_loss = loss.sum() / valid.to(dtype=target.dtype).sum().clamp_min(1.0)
 
         teacher_logits = x0_pred.detach()
-        teacher_probs = torch.sigmoid(teacher_logits) * valid.to(dtype=target.dtype)
+        teacher_probs = ((teacher_logits + 1.0) * 0.5).clamp(0.0, 1.0) * valid.to(dtype=target.dtype)
         teacher_mask = (teacher_probs > 0.5).to(dtype=target.dtype) * valid.to(dtype=target.dtype)
 
         if self.debug_shapes and not self._debug_printed:

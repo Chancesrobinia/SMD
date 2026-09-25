@@ -138,6 +138,9 @@ fi
 if [[ "${SMD_DEBUG_SHAPES:-0}" != "0" ]]; then
     cmd+=(--smd_debug_shapes)
 fi
+if [[ "${RAW_OBS_FUSION:-1}" != "0" ]]; then
+    cmd+=(--use_graph_raw_obs_fusion)
+fi
 
 cmd+=("$@")
 

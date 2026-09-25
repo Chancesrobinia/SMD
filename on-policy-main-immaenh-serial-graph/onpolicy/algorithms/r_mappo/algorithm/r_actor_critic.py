@@ -17,6 +17,33 @@ from onpolicy.algorithms.utils.smac_obs_adapter import SMACHeteroObservationAdap
 from onpolicy.utils.util import get_shape_from_obs_space
 
 
+class GraphRawObservationFusion(nn.Module):
+    """Residual path from the local flat SMAC observation to the actor RNN."""
+
+    def __init__(self, obs_dim, hidden_size, use_ReLU=True):
+        super(GraphRawObservationFusion, self).__init__()
+        input_dim = hidden_size + obs_dim
+        activation = nn.ReLU() if use_ReLU else nn.Tanh()
+        self.delta = nn.Sequential(
+            nn.Linear(input_dim, hidden_size),
+            activation,
+            nn.Linear(hidden_size, hidden_size),
+        )
+        self.gate = nn.Linear(input_dim, hidden_size)
+        # Start close to the graph-only policy while keeping the raw path live.
+        nn.init.xavier_uniform_(self.delta[-1].weight, gain=0.1)
+        nn.init.zeros_(self.delta[-1].bias)
+        nn.init.zeros_(self.gate.weight)
+        nn.init.constant_(self.gate.bias, -2.0)
+        self.last_gate_mean = None
+
+    def forward(self, graph_feature, raw_obs):
+        combined = torch.cat([graph_feature, raw_obs], dim=-1)
+        gate = torch.sigmoid(self.gate(combined))
+        self.last_gate_mean = gate.detach().mean()
+        return graph_feature + gate * self.delta(combined)
+
+
 class R_Actor(nn.Module):
     """
     Actor network class for MAPPO. Outputs actions given observations.
@@ -50,6 +77,11 @@ class R_Actor(nn.Module):
             and self.env_name == 'StarCraft2'
             and obs_space.__class__.__name__ == 'list'
         )
+        self._use_graph_raw_obs_fusion = getattr(args, 'use_graph_raw_obs_fusion', False)
+        if self._use_graph_raw_obs_fusion and not self._use_smac_hetero:
+            raise ValueError("graph raw observation fusion requires classic SMAC HeteroGraph actor")
+        self.raw_obs_fusion = None
+        self.last_raw_obs_gate_mean = None
         self._use_world_comm_hetero = (
             self._use_hetero_graph and self.scenario_name == 'simple_world_comm'
         )
@@ -71,6 +103,8 @@ class R_Actor(nn.Module):
         self._use_gsd_bsd = getattr(args, 'use_gsd_bsd', False)
         if self._use_smd and self._use_gsd_bsd:
             raise RuntimeError("use_smd and use_gsd_bsd cannot be enabled together")
+        if self._use_smd and not self._use_hetero_graph:
+            raise ValueError("SMAC SMD requires --use_hetero_graph")
         self.last_graph_gates = None
 
         # ============================================================
@@ -87,7 +121,7 @@ class R_Actor(nn.Module):
                     obs_space,
                     debug_shapes=getattr(args, 'smd_debug_shapes', False),
                     include_move_context=self._use_smd,
-                    preserve_move_in_state=self._use_smd,
+                    preserve_move_in_state=False,
                 )
                 self.smac_obs_dim = self.smac_adapter.obs_dim
                 self.smac_n_allies = self.smac_adapter.n_allies
@@ -147,6 +181,8 @@ class R_Actor(nn.Module):
 
             if self._use_parallel_ally_graph and self._use_entity_enemy_first_graph:
                 raise ValueError("--use_parallel_ally_graph and --use_entity_enemy_first_graph are mutually exclusive")
+            if self._use_smd and (self._use_parallel_ally_graph or self._use_entity_enemy_first_graph):
+                raise ValueError("SMD requires the three-hop HeteroGraphActorBase")
             if self._use_parallel_ally_graph:
                 graph_base_cls = ParallelAllyEntityGraphActorBase
             elif self._use_entity_enemy_first_graph:
@@ -207,7 +243,8 @@ class R_Actor(nn.Module):
                 ),
                 ctx_dim=(self.smac_move_dim if self._use_smac_hetero and self._use_smd
                          else (1 if self._use_smac_hetero else self.landmark_dim)),
-                distance_feature_index=2 if self._use_smac_hetero and self._use_smd else None,
+                distance_feature_index=(self.smac_adapter.ally_distance_index
+                                        if self._use_smac_hetero and self._use_smd else None),
                 hidden_size=self.hidden_size,
                 use_orthogonal=self._use_orthogonal,
                 use_ReLU=getattr(args, 'use_ReLU', True),
@@ -259,6 +296,11 @@ class R_Actor(nn.Module):
         else:
             base = CNNBase if len(obs_shape) == 3 else MLPBase
             self.base = base(args, obs_shape)
+
+        if self._use_graph_raw_obs_fusion:
+            self.raw_obs_fusion = GraphRawObservationFusion(
+                self.smac_obs_dim, self.hidden_size, use_ReLU=getattr(args, 'use_ReLU', True)
+            )
 
         if self._use_naive_recurrent_policy or self._use_recurrent_policy:
             self.rnn = RNNLayer(self.hidden_size, self.hidden_size, self._recurrent_N, self._use_orthogonal)
@@ -678,6 +720,9 @@ class R_Actor(nn.Module):
             else:
                 actor_features, latent_beliefs = graph_out
                 self.last_graph_gates = None
+            if self.raw_obs_fusion is not None:
+                actor_features = self.raw_obs_fusion(actor_features, obs)
+                self.last_raw_obs_gate_mean = self.raw_obs_fusion.last_gate_mean
             return actor_features, latent_beliefs
         elif self._use_esmg:
             self_obs, neighbor_obs = self._split_esmg_obs(obs)
